@@ -53,6 +53,12 @@ pub struct Group {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<crate::format::xml_db::meta::CustomData>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_parent_group: Option<UUID>,
+
+    #[serde(default, with = "cs_opt_string")]
+    pub tags: Option<String>,
+
     #[serde(default, rename = "$value")]
     pub children: Vec<GroupOrEntry>,
 }
@@ -89,6 +95,12 @@ impl Group {
         target.enable_autotype = self.enable_auto_type;
         target.enable_searching = self.enable_searching;
         target.last_top_visible_entry = self.last_top_visible_entry.map(|u| EntryId::from_uuid(u.0));
+
+        target.previous_parent_group = self.previous_parent_group.map(|u| GroupId::from_uuid(u.0));
+        target.tags = self
+            .tags
+            .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
 
         if let Some(cd) = self.custom_data {
             target.custom_data = cd.into();
@@ -150,6 +162,12 @@ impl Group {
             enable_searching: source.enable_searching,
             last_top_visible_entry: source.last_top_visible_entry.map(|eid| UUID(eid.uuid())),
             custom_data,
+            previous_parent_group: source.previous_parent_group.map(|gid| UUID(gid.uuid())),
+            tags: if source.tags.is_empty() {
+                None
+            } else {
+                Some(source.tags.join(","))
+            },
             children,
         })
     }
@@ -184,6 +202,8 @@ mod tests {
             <EnableAutoType>True</EnableAutoType>
             <EnableSearching>False</EnableSearching>
             <LastTopVisibleEntry>AAECAwQFBgcICQoLDA0ODw==</LastTopVisibleEntry>
+            <PreviousParentGroup>oaKjpLGywcLR0tPU1dbX2A==</PreviousParentGroup>
+            <Tags>tag1,tag2,tag3</Tags>
             <CustomData>
                 <Item>
                     <Key>example_key</Key>
@@ -224,6 +244,11 @@ mod tests {
         assert_eq!(group.0.enable_auto_type.unwrap(), true);
         assert_eq!(group.0.enable_searching.unwrap(), false);
         assert_eq!(group.0.custom_data.is_some(), true);
+        assert_eq!(
+            group.0.previous_parent_group.unwrap().0.to_string(),
+            "a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8"
+        );
+        assert_eq!(group.0.tags.unwrap(), "tag1,tag2,tag3");
         assert_eq!(group.0.children.len(), 4);
     }
 }

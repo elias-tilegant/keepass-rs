@@ -164,6 +164,8 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
             dest_group.enable_autotype = source.enable_autotype;
             dest_group.enable_searching = source.enable_searching;
             dest_group.last_top_visible_entry = source.last_top_visible_entry;
+            dest_group.previous_parent_group = source.previous_parent_group;
+            dest_group.tags = source.tags.clone();
 
             log.events.push(MergeEvent {
                 target: MergeEventTarget::Group(id),
@@ -536,6 +538,7 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             dest_entry.background_color = source_entry.background_color.clone();
             dest_entry.override_url = source_entry.override_url.clone();
             dest_entry.quality_check = source_entry.quality_check;
+            dest_entry.previous_parent_group = source_entry.previous_parent_group;
 
             // TODO: attachments and custom_icons_id
 

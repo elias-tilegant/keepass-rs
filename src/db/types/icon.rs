@@ -56,6 +56,12 @@ pub struct CustomIcon {
     pub(crate) groups: HashSet<GroupId>,
 
     pub data: Vec<u8>,
+
+    /// Display name for the custom icon (KDBX 4.1)
+    pub name: Option<String>,
+
+    /// Last modification time for the custom icon (KDBX 4.1)
+    pub last_modification_time: Option<chrono::NaiveDateTime>,
 }
 
 impl CustomIcon {

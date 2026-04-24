@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     crypt::{ciphers::Cipher, CryptographyError},
-    db::{AttachmentId, Color, EntryId},
+    db::{AttachmentId, Color, EntryId, GroupId},
     format::xml_db::{
         custom_serde::{cs_bool, cs_opt_bool, cs_opt_fromstr, cs_opt_string},
         meta::CustomData,
@@ -57,6 +57,12 @@ pub struct Entry {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomData>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_parent_group: Option<UUID>,
+
+    #[serde(default, with = "cs_opt_bool")]
+    pub quality_check: Option<bool>,
 }
 
 impl Entry {
@@ -130,6 +136,9 @@ impl Entry {
         if let Some(cd) = self.custom_data {
             target.custom_data = cd.into();
         }
+
+        target.previous_parent_group = self.previous_parent_group.map(|u| GroupId::from_uuid(u.0));
+        target.quality_check = self.quality_check;
 
         Ok(())
     }
@@ -208,6 +217,8 @@ impl Entry {
             auto_type: db.autotype.as_ref().map(|at| at.clone().into()),
             history,
             custom_data,
+            previous_parent_group: db.previous_parent_group.map(|gid| UUID(gid.uuid())),
+            quality_check: db.quality_check,
         })
     }
 }

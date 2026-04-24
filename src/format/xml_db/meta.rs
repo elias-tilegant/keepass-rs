@@ -441,6 +441,12 @@ pub struct Icon {
     #[serde(rename = "UUID")]
     pub uuid: UUID,
 
+    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
+    pub last_modification_time: Option<Timestamp>,
+
     #[serde(with = "cs_base64")]
     pub data: Vec<u8>,
 }
@@ -449,6 +455,8 @@ impl From<crate::db::CustomIcon> for Icon {
     fn from(db: crate::db::CustomIcon) -> Self {
         Self {
             uuid: UUID(db.id().uuid()),
+            name: db.name.clone(),
+            last_modification_time: db.last_modification_time.map(Timestamp::new_iso8601),
             data: db.data.clone(),
         }
     }
@@ -461,6 +469,8 @@ impl From<Icon> for crate::db::CustomIcon {
             entries: HashSet::new(),
             groups: HashSet::new(),
             data: icon.data,
+            name: icon.name,
+            last_modification_time: icon.last_modification_time.map(|t| t.time),
         }
     }
 }
@@ -564,6 +574,8 @@ mod tests {
             uuid: UUID(Uuid::from_bytes([
                 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
             ])),
+            name: None,
+            last_modification_time: None,
             data: vec![1, 2, 3, 4, 5],
         };
 
@@ -624,6 +636,8 @@ mod tests {
                         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
                         0x0e, 0x0f,
                     ])),
+                    name: None,
+                    last_modification_time: None,
                     data: vec![1, 2, 3, 4, 5],
                 }],
             }),

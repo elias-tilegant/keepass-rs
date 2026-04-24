@@ -85,6 +85,12 @@ pub struct Group {
 
     /// UUID for the last top visible entry
     pub(crate) last_top_visible_entry: Option<EntryId>,
+
+    /// UUID of the previous parent group (KDBX 4.1)
+    pub previous_parent_group: Option<GroupId>,
+
+    /// Tags for the group (KDBX 4.1)
+    pub tags: Vec<String>,
 }
 
 impl Group {
@@ -109,6 +115,8 @@ impl Group {
             enable_autotype: None,
             enable_searching: None,
             last_top_visible_entry: None,
+            previous_parent_group: None,
+            tags: Vec::new(),
         }
     }
 
@@ -128,6 +136,8 @@ impl Group {
             enable_autotype: None,
             enable_searching: None,
             last_top_visible_entry: None,
+            previous_parent_group: None,
+            tags: Vec::new(),
         }
     }
 
@@ -449,6 +459,8 @@ impl GroupMut<'_> {
                 entries: HashSet::new(),
                 groups: vec![id].into_iter().collect(),
                 data,
+                name: None,
+                last_modification_time: None,
             },
         );
 

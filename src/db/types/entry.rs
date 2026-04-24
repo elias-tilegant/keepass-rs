@@ -59,6 +59,9 @@ pub struct Entry {
     pub override_url: Option<String>,
     pub quality_check: Option<bool>,
 
+    /// UUID of the previous parent group (KDBX 4.1)
+    pub previous_parent_group: Option<GroupId>,
+
     pub(crate) attachments: HashMap<String, AttachmentId>,
 
     pub history: Option<History>,
@@ -83,6 +86,7 @@ impl Entry {
             background_color: None,
             override_url: None,
             quality_check: None,
+            previous_parent_group: None,
             attachments: HashMap::new(),
             history: Some(History::default()),
         }
@@ -501,6 +505,8 @@ impl EntryMut<'_> {
                 entries: vec![(id, history_index)].into_iter().collect(),
                 groups: HashSet::new(),
                 data,
+                name: None,
+                last_modification_time: None,
             },
         );
 
