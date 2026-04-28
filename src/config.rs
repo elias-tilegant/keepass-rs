@@ -311,7 +311,17 @@ impl KdfConfig {
 
         match self {
             KdfConfig::Aes { rounds } => {
-                vd.set(KDF_ID, KDF_AES_KDBX4.to_vec());
+                // KeePass2 / KeePassXC only recognise the standard AES-KDF
+                // UUID `c9d9f39a-628a-4460-bf74-0d08c18a4fea` (= KDBX3).
+                // Writing `KDF_AES_KDBX4` (`7c02bb82…`) here produced files
+                // that no other KeePass client could open ("Unknown key
+                // derivation function" in KeePass2, "Invalid number value"
+                // in KeePassXC). The KeePass file-format spec defines a
+                // single AES-KDF UUID across kdbx3 and kdbx4; the
+                // distinction is only in how the params are wrapped
+                // (legacy header bytes vs. variant dictionary), not in the
+                // identifier.
+                vd.set(KDF_ID, KDF_AES_KDBX3.to_vec());
                 vd.set(KDF_ROUNDS, *rounds);
                 vd.set(KDF_SEED, seed.to_vec());
             }
@@ -469,4 +479,56 @@ pub enum CompressionConfigError {
     /// The identifier for the compression algorithm specified in the database is invalid
     #[error("Invalid compression algorithm: {}", cid)]
     InvalidCompressionSuite { cid: u32 },
+}
+
+#[cfg(all(test, feature = "save_kdbx4"))]
+mod kdf_dump_tests {
+    use super::*;
+
+    /// Regression test for the AES-KDF UUID write bug.
+    ///
+    /// Prior to the fix, `KdfConfig::Aes` was serialised with the constant
+    /// `KDF_AES_KDBX4` (`7c02bb82-79a7-4ac0-927d-114a00648238`), which is not
+    /// a UUID defined by the KeePass file-format spec. As a result, files
+    /// written by `keepass-rs` could not be opened by KeePass2 ("Unknown key
+    /// derivation function") or KeePassXC ("Invalid number value"). The
+    /// correct, spec-defined AES-KDF UUID is `c9d9f39a-628a-4460-bf74-
+    /// 0d08c18a4fea` — the same value `KDF_AES_KDBX3` already held.
+    #[test]
+    fn aes_kdf_dumps_standard_uuid() {
+        let cfg = KdfConfig::Aes { rounds: 60_000 };
+        let vd = cfg.to_variant_dictionary(&[0u8; 32]);
+        let uuid = vd.get::<Vec<u8>>(KDF_ID).expect("KDF $UUID present");
+        assert_eq!(
+            uuid.as_slice(),
+            &KDF_AES_KDBX3,
+            "AES-KDF must serialise with the spec UUID c9d9f39a…",
+        );
+    }
+
+    /// Sanity check for the Argon2 family — both UUIDs in the spec are well-
+    /// known, this test pins them so accidental edits to the constants get
+    /// caught by CI rather than by users with corrupted vaults.
+    #[test]
+    fn argon2_variants_dump_standard_uuids() {
+        let argon2d = KdfConfig::Argon2 {
+            iterations: 10,
+            memory: 64 * 1024 * 1024,
+            parallelism: 2,
+            version: argon2::Version::Version13,
+        };
+        let vd = argon2d.to_variant_dictionary(&[0u8; 32]);
+        let uuid = vd.get::<Vec<u8>>(KDF_ID).expect("KDF $UUID present");
+        assert_eq!(uuid.as_slice(), &KDF_ARGON2);
+
+        let argon2id = KdfConfig::Argon2id {
+            iterations: 10,
+            memory: 64 * 1024 * 1024,
+            parallelism: 2,
+            version: argon2::Version::Version13,
+        };
+        let vd = argon2id.to_variant_dictionary(&[0u8; 32]);
+        let uuid = vd.get::<Vec<u8>>(KDF_ID).expect("KDF $UUID present");
+        assert_eq!(uuid.as_slice(), &KDF_ARGON2ID);
+    }
 }
