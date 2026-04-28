@@ -23,31 +23,39 @@ pub struct Group {
 
     pub name: String,
 
-    #[serde(default, with = "cs_opt_string")]
+    // See note in `meta.rs` — every Option needs `skip_serializing_if` so
+    // we don't emit `<Tag/>` placeholders that other KeePass clients reject
+    // as malformed numbers / base64 / dateTime values.
+    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
 
-    #[serde(default, rename = "IconID", with = "cs_opt_fromstr")]
+    #[serde(
+        default,
+        rename = "IconID",
+        with = "cs_opt_fromstr",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub icon_id: Option<usize>,
 
     #[serde(default, rename = "CustomIconUUID", skip_serializing_if = "Option::is_none")]
     pub custom_icon_uuid: Option<UUID>,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub times: Option<Times>,
 
-    #[serde(default, with = "cs_opt_bool")]
+    #[serde(default, with = "cs_opt_bool", skip_serializing_if = "Option::is_none")]
     pub is_expanded: Option<bool>,
 
-    #[serde(default, with = "cs_opt_string")]
+    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
     pub default_auto_type_sequence: Option<String>,
 
-    #[serde(default, with = "cs_opt_bool")]
+    #[serde(default, with = "cs_opt_bool", skip_serializing_if = "Option::is_none")]
     pub enable_auto_type: Option<bool>,
 
-    #[serde(default, with = "cs_opt_bool")]
+    #[serde(default, with = "cs_opt_bool", skip_serializing_if = "Option::is_none")]
     pub enable_searching: Option<bool>,
 
-    #[serde(default, with = "cs_opt_string")]
+    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
     pub last_top_visible_entry: Option<UUID>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,7 +64,7 @@ pub struct Group {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_parent_group: Option<UUID>,
 
-    #[serde(default, with = "cs_opt_string")]
+    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
     pub tags: Option<String>,
 
     #[serde(default, rename = "$value")]
