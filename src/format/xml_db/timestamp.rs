@@ -45,9 +45,14 @@ impl From<Timestamp> for NaiveDateTime {
 
 impl From<NaiveDateTime> for Timestamp {
     fn from(t: NaiveDateTime) -> Self {
-        // NOTE: always use ISO8601 for serialization. We could remember the original format to
-        // have more faithful round-tripping
-        Timestamp::new_iso8601(t)
+        // KDBX 4 mandates base64-encoded i64 seconds (since 0001-01-01) for
+        // every timestamp element. KeePass2 enforces this strictly and rejects
+        // ISO 8601 with "Die Eingabe ist keine gültige Base-64-Zeichenfolge"
+        // (it tries `Convert.FromBase64String` on the timestamp). KeePassXC is
+        // more forgiving and will read either form. Defaulting to Base64 here
+        // keeps cross-client interop. ISO 8601 mode is still available via
+        // `Timestamp::new_iso8601` for KDBX 3 callers.
+        Timestamp::new_base64(t)
     }
 }
 
