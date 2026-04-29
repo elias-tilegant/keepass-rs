@@ -175,7 +175,11 @@ impl KeePassFile {
                     .iter()
                     .map(|(uuid, deletion_time)| DeletedObject {
                         uuid: UUID(*uuid),
-                        deletion_time: deletion_time.map(Timestamp::new_iso8601),
+                        // KDBX 4 mandates base64-encoded i64 seconds. The
+                        // `From<NaiveDateTime>` default is Base64, but this
+                        // explicit `new_iso8601` override sneaks ISO 8601
+                        // back in and KeePass2 rejects the file.
+                        deletion_time: deletion_time.map(Timestamp::new_base64),
                     })
                     .collect(),
             })

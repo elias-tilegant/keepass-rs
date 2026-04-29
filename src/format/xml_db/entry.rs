@@ -9,7 +9,7 @@ use crate::{
     crypt::{ciphers::Cipher, CryptographyError},
     db::{AttachmentId, Color, EntryId, GroupId},
     format::xml_db::{
-        custom_serde::{cs_bool, cs_opt_bool, cs_opt_fromstr, cs_opt_string},
+        custom_serde::{cs_bool, cs_opt_autotype_obfuscation, cs_opt_bool, cs_opt_fromstr, cs_opt_string},
         meta::CustomData,
         times::Times,
         UUID,
@@ -313,7 +313,11 @@ pub struct AutoType {
     #[serde(default, with = "cs_bool")]
     pub enabled: bool,
 
-    #[serde(default, with = "cs_opt_bool", skip_serializing_if = "Option::is_none")]
+    // Per KDBX XSD this is `xs:int` (0 or 1), not `xs:boolean`. Writing
+    // `True`/`False` causes KeePassXC to reject the file with "invalid
+    // number value". The custom serde helper emits 0/1 and accepts both
+    // numeric and boolean shapes on read.
+    #[serde(default, with = "cs_opt_autotype_obfuscation", skip_serializing_if = "Option::is_none")]
     pub data_transfer_obfuscation: Option<bool>,
 
     #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
@@ -494,9 +498,12 @@ mod tests {
         };
 
         let serialized = quick_xml::se::to_string(&Test(autotype)).unwrap();
+        // DataTransferObfuscation is `xs:int` per the KDBX schema (0 or 1),
+        // not `xs:boolean` ("True"/"False"). KeePassXC rejects the bool form
+        // with "invalid number value".
         assert_eq!(
             serialized,
-            r#"<Test><Enabled>True</Enabled><DataTransferObfuscation>False</DataTransferObfuscation><DefaultSequence>{USERNAME}{TAB}{PASSWORD}{ENTER}</DefaultSequence><Association><Window>Example Window</Window><KeystrokeSequence>{USERNAME}{TAB}{PASSWORD}{ENTER}</KeystrokeSequence></Association></Test>"#
+            r#"<Test><Enabled>True</Enabled><DataTransferObfuscation>0</DataTransferObfuscation><DefaultSequence>{USERNAME}{TAB}{PASSWORD}{ENTER}</DefaultSequence><Association><Window>Example Window</Window><KeystrokeSequence>{USERNAME}{TAB}{PASSWORD}{ENTER}</KeystrokeSequence></Association></Test>"#
         );
     }
 

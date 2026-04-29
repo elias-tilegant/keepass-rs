@@ -499,7 +499,12 @@ impl From<crate::db::CustomIcon> for Icon {
         Self {
             uuid: UUID(db.id().uuid()),
             name: db.name.clone(),
-            last_modification_time: db.last_modification_time.map(Timestamp::new_iso8601),
+            // KDBX 4 mandates base64-encoded i64 seconds for every timestamp.
+            // Earlier we set the `From<NaiveDateTime>` default to Base64, but
+            // this site explicitly chose `new_iso8601`, overriding the
+            // default. KeePass2 hard-fails on ISO 8601 in KDBX 4 ("Die
+            // Eingabe ist keine gültige Base-64-Zeichenfolge").
+            last_modification_time: db.last_modification_time.map(Timestamp::new_base64),
             data: db.data.clone(),
         }
     }

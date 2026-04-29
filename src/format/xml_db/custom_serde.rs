@@ -126,6 +126,43 @@ pub mod cs_opt_fromstr {
     }
 }
 
+/// `AutoType/DataTransferObfuscation` — KeePass's XSD declares this as
+/// `xs:int` (0 or 1), not `xs:boolean`. Writing `True`/`False` causes
+/// KeePassXC to reject the file with "invalid number value". This serde
+/// helper writes 0/1 on save and accepts both number- and boolean-shaped
+/// inputs on read for tolerance with whatever earlier writers produced.
+pub mod cs_opt_autotype_obfuscation {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(data: &Option<bool>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match data {
+            Some(false) => s.serialize_str("0"),
+            Some(true) => s.serialize_str("1"),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match Option::<String>::deserialize(d)?
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("") | Some("Null") | Some("null") => Ok(None),
+            Some("0") | Some("False") | Some("false") => Ok(Some(false)),
+            Some("1") | Some("True") | Some("true") => Ok(Some(true)),
+            Some(v) => Err(serde::de::Error::custom(format!(
+                "invalid DataTransferObfuscation value: {v}"
+            ))),
+        }
+    }
+}
+
 /// Optional stringly value that may be missing or empty
 /// (e.g. `<Name></Name>` or `<Name/>`)
 pub mod cs_opt_string {
