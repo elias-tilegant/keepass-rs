@@ -242,7 +242,9 @@ pub struct DeletedObject {
     #[serde(rename = "UUID")]
     uuid: UUID,
 
-    #[serde(default, with = "cs_opt_string")]
+    // See note in `meta.rs` — `Option<Timestamp>` must skip when None or
+    // KeePass2 chokes parsing the empty `<DeletionTime/>` as base64 ticks.
+    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
     deletion_time: Option<Timestamp>,
 }
 

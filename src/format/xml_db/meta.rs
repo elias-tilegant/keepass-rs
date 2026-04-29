@@ -338,7 +338,11 @@ struct CustomDataItem {
     key: String,
     value: CustomDataValue,
 
-    #[serde(default, with = "cs_opt_string")]
+    // See note in `meta.rs` — `Option<Timestamp>` must skip when None or
+    // KeePass2 fails to parse the empty `<LastModificationTime/>` as
+    // base64 ticks. CustomData entries from KeePass plugins frequently
+    // lack a timestamp, so this matters in real vaults.
+    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
     last_modification_time: Option<Timestamp>,
 }
 
@@ -522,9 +526,12 @@ mod tests {
 
         let serialized = quick_xml::se::to_string(&cd).unwrap();
 
+        // Item 2's `last_modification_time` is None — must be skipped from
+        // the XML entirely (no empty `<LastModificationTime/>`), otherwise
+        // KeePass2 fails to parse the empty body as base64 ticks.
         assert_eq!(
             serialized,
-            "<CustomData><Item><Key>example_key</Key><Value>example_value</Value><LastModificationTime>cKSw3A4AAAA=</LastModificationTime></Item><Item><Key>binary_key</Key><Value>AQIDBAU=</Value><LastModificationTime/></Item></CustomData>"
+            "<CustomData><Item><Key>example_key</Key><Value>example_value</Value><LastModificationTime>cKSw3A4AAAA=</LastModificationTime></Item><Item><Key>binary_key</Key><Value>AQIDBAU=</Value></Item></CustomData>"
         );
         assert!(serialized.contains("<Key>example_key</Key>"));
         assert!(serialized.contains("<Value>example_value</Value>"));
