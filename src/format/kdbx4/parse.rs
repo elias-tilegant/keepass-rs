@@ -37,6 +37,19 @@ pub(crate) fn parse_kdbx4(data: &[u8], db_key: &DatabaseKey) -> Result<Database,
     Ok(db)
 }
 
+/// Decrypt a KDBX4 file and return the inner cleartext XML, no further
+/// XML→Database parsing. Intended for diagnostics — comparing what the
+/// crate's writer produces against what KeePass2/XC expect on read.
+///
+/// Returns the XML bytes (typically UTF-8). Caller can `String::from_utf8_lossy`.
+pub fn debug_decrypt_to_xml(
+    data: &[u8],
+    key: &DatabaseKey,
+) -> Result<Vec<u8>, DatabaseOpenError> {
+    let (_config, _attachments, _inner, xml) = decrypt_kdbx4(data, key)?;
+    Ok(xml)
+}
+
 /// Open and decrypt a KeePass KDBX4 database from a source and key elements
 #[allow(clippy::type_complexity)]
 pub(crate) fn decrypt_kdbx4(

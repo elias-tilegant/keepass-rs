@@ -11,7 +11,9 @@ use crate::{
 pub(crate) use crate::format::kdbx4::dump::dump_kdbx4;
 pub(crate) use crate::format::kdbx4::parse::{decrypt_kdbx4, parse_kdbx4};
 
-pub use crate::format::kdbx4::parse::{Kdbx4InnerHeaderError, Kdbx4OpenError, Kdbx4OuterHeaderError};
+pub use crate::format::kdbx4::parse::{
+    debug_decrypt_to_xml, Kdbx4InnerHeaderError, Kdbx4OpenError, Kdbx4OuterHeaderError,
+};
 
 #[cfg(feature = "save_kdbx4")]
 /// Size for a master seed in bytes
