@@ -238,6 +238,12 @@ pub struct DeletedObjects {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+// `rename_all = "PascalCase"` is REQUIRED here — without it, `deletion_time`
+// serialises as snake_case `<deletion_time>` and we lose the value on every
+// read+write of any KeePass2-written vault (which writes `<DeletionTime>`).
+// Real-world vaults have hundreds of DeletedObjects from years of use; the
+// missing field made KeePass2 reject the saved file outright.
+#[serde(rename_all = "PascalCase")]
 pub struct DeletedObject {
     #[serde(rename = "UUID")]
     uuid: UUID,

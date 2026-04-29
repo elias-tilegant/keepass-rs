@@ -39,10 +39,25 @@ pub struct Meta {
     #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
     database_description_changed: Option<Timestamp>,
 
-    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
+    // KeePass writes `<DefaultUserName>` (capital N in Name); naive
+    // PascalCase from `default_username` produces `<DefaultUsername>`
+    // (lower n), which round-trips fine within this crate but loses the
+    // value when read from KeePass2/XC vaults. Same for the corresponding
+    // changed-timestamp.
+    #[serde(
+        default,
+        rename = "DefaultUserName",
+        with = "cs_opt_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     default_username: Option<String>,
 
-    #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "DefaultUserNameChanged",
+        with = "cs_opt_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     default_username_changed: Option<Timestamp>,
 
     #[serde(default, with = "cs_opt_fromstr", skip_serializing_if = "Option::is_none")]
@@ -406,7 +421,15 @@ struct MemoryProtection {
     #[serde(default, with = "cs_opt_bool", skip_serializing_if = "Option::is_none")]
     protect_title: Option<bool>,
 
-    #[serde(default, with = "cs_opt_bool", skip_serializing_if = "Option::is_none")]
+    // KeePass writes `<ProtectUserName>` (capital N). Naive PascalCase
+    // would emit `<ProtectUsername>` (lower n) and silently lose the
+    // value when round-tripping vaults from other clients.
+    #[serde(
+        default,
+        rename = "ProtectUserName",
+        with = "cs_opt_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
     protect_username: Option<bool>,
 
     #[serde(default, with = "cs_opt_bool", skip_serializing_if = "Option::is_none")]
@@ -578,12 +601,12 @@ mod tests {
         };
 
         let serialized = quick_xml::se::to_string(&mp).unwrap();
-        assert_eq!(serialized, "<MemoryProtection><ProtectTitle>True</ProtectTitle><ProtectUsername>False</ProtectUsername><ProtectPassword>True</ProtectPassword><ProtectURL>False</ProtectURL><ProtectNotes>True</ProtectNotes></MemoryProtection>");
+        assert_eq!(serialized, "<MemoryProtection><ProtectTitle>True</ProtectTitle><ProtectUserName>False</ProtectUserName><ProtectPassword>True</ProtectPassword><ProtectURL>False</ProtectURL><ProtectNotes>True</ProtectNotes></MemoryProtection>");
     }
 
     #[test]
     fn test_deserialize_memory_protection() {
-        let mp: MemoryProtection = quick_xml::de::from_str( "<MemoryProtection><ProtectTitle>True</ProtectTitle><ProtectUsername>False</ProtectUsername><ProtectPassword>True</ProtectPassword><ProtectURL>False</ProtectURL><ProtectNotes>True</ProtectNotes></MemoryProtection>").unwrap();
+        let mp: MemoryProtection = quick_xml::de::from_str( "<MemoryProtection><ProtectTitle>True</ProtectTitle><ProtectUserName>False</ProtectUserName><ProtectPassword>True</ProtectPassword><ProtectURL>False</ProtectURL><ProtectNotes>True</ProtectNotes></MemoryProtection>").unwrap();
         assert_eq!(mp.protect_title, Some(true));
         assert_eq!(mp.protect_username, Some(false));
         assert_eq!(mp.protect_password, Some(true));
@@ -730,8 +753,8 @@ mod tests {
         assert!(serialized.contains("<DatabaseNameChanged>2023-10-05T12:34:56Z</DatabaseNameChanged>"));
         assert!(serialized.contains("<DatabaseDescription>A test database</DatabaseDescription>"));
         assert!(serialized.contains("<DatabaseDescriptionChanged>cKSw3A4AAAA=</DatabaseDescriptionChanged>"));
-        assert!(serialized.contains("<DefaultUsername>admin</DefaultUsername>"));
-        assert!(serialized.contains("<DefaultUsernameChanged>2023-10-05T12:34:56Z</DefaultUsernameChanged>"));
+        assert!(serialized.contains("<DefaultUserName>admin</DefaultUserName>"));
+        assert!(serialized.contains("<DefaultUserNameChanged>2023-10-05T12:34:56Z</DefaultUserNameChanged>"));
         assert!(serialized.contains("<MaintenanceHistoryDays>30</MaintenanceHistoryDays>"));
         assert!(serialized.contains("<Color>#FF0000</Color>"));
         assert!(serialized.contains("<MasterKeyChanged>cKSw3A4AAAA=</MasterKeyChanged>"));
@@ -763,8 +786,8 @@ mod tests {
             <DatabaseNameChanged>2023-10-05T12:34:56Z</DatabaseNameChanged>
             <DatabaseDescription>A test database</DatabaseDescription>
             <DatabaseDescriptionChanged>cKSw3A4AAAA=</DatabaseDescriptionChanged>
-            <DefaultUsername>admin</DefaultUsername>
-            <DefaultUsernameChanged>2023-10-05T12:34:56Z</DefaultUsernameChanged>
+            <DefaultUserName>admin</DefaultUserName>
+            <DefaultUserNameChanged>2023-10-05T12:34:56Z</DefaultUserNameChanged>
             <MaintenanceHistoryDays>30</MaintenanceHistoryDays>
             <Color>#FF0000</Color>
             <MasterKeyChanged>cKSw3A4AAAA=</MasterKeyChanged>
@@ -772,7 +795,7 @@ mod tests {
             <MasterKeyChangeForce>42</MasterKeyChangeForce>
             <MemoryProtection>
                 <ProtectTitle>True</ProtectTitle>
-                <ProtectUsername>False</ProtectUsername>
+                <ProtectUserName>False</ProtectUserName>
                 <ProtectPassword>True</ProtectPassword>
                 <ProtectURL>False</ProtectURL>
                 <ProtectNotes>True</ProtectNotes>
