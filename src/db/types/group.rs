@@ -327,7 +327,12 @@ impl GroupMut<'_> {
         EntryMut::new(self.database, id)
     }
 
-    pub(crate) fn add_entry_with_id(&mut self, id: EntryId) -> EntryMut<'_> {
+    /// Add an entry with a caller-provided `EntryId` instead of a freshly
+    /// generated one. Panics if an entry with that id already exists in the
+    /// database (caller's responsibility to avoid collisions — the typical
+    /// safe use is "import a remote-only entry during merge", where the id
+    /// is by construction absent locally).
+    pub fn add_entry_with_id(&mut self, id: EntryId) -> EntryMut<'_> {
         if self.database.entries.contains_key(&id) {
             panic!("Entry with ID {} already exists", id);
         }
@@ -339,7 +344,9 @@ impl GroupMut<'_> {
         EntryMut::new(self.database, id)
     }
 
-    pub(crate) fn add_group_with_id(&mut self, id: GroupId) -> GroupMut<'_> {
+    /// Symmetric counterpart to [`add_entry_with_id`] for groups. Same
+    /// caller-provides-the-id semantics; same panic behaviour on collision.
+    pub fn add_group_with_id(&mut self, id: GroupId) -> GroupMut<'_> {
         if self.database.groups.contains_key(&id) {
             panic!("Group with ID {} already exists", id);
         }

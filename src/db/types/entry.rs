@@ -26,7 +26,10 @@ impl EntryId {
         Self(Uuid::new_v4())
     }
 
-    pub(crate) const fn from_uuid(uuid: Uuid) -> Self {
+    /// Construct an `EntryId` from a raw UUID. Used by consumers that need
+    /// to insert entries with a specific (foreign-sourced) identity, e.g.
+    /// when applying a remote-side entry during a three-way merge.
+    pub const fn from_uuid(uuid: Uuid) -> Self {
         Self(uuid)
     }
 
