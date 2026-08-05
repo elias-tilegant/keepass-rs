@@ -1,10 +1,13 @@
-use std::{collections::HashSet, ops::Deref};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Deref,
+};
 
 use chrono::NaiveDateTime;
 use thiserror::Error;
 
 use crate::{
-    db::{Entry, EntryId, Group, GroupId, GroupRef, History, MoveGroupError, Times},
+    db::{Attachment, AttachmentId, Entry, EntryId, Group, GroupId, GroupRef, History, MoveGroupError, Times},
     Database,
 };
 
@@ -41,6 +44,9 @@ pub enum MergeError {
     #[error("Found history entries with the same timestamp ({0}) for entry {1}.")]
     DuplicateHistoryEntries(NaiveDateTime, EntryId),
 
+    #[error("Attachment {0} is referenced by an entry but missing from the source database.")]
+    AttachmentNotFound(AttachmentId),
+
     #[error(transparent)]
     MoveGroupError(#[from] MoveGroupError),
 }
@@ -58,9 +64,98 @@ impl Database {
     pub fn merge(&mut self, other: &Database) -> Result<MergeLog, MergeError> {
         let mut log = MergeLog::default();
         merge_groups(self, other, &mut log)?;
+        rebuild_attachment_references(self);
 
         Ok(log)
     }
+}
+
+/// Clone an entry from another database and translate every database-local
+/// attachment ID (including historical versions) into the destination's ID
+/// space. Equal attachment values are shared; new values are copied once.
+fn import_entry(dest_db: &mut Database, source_db: &Database, source: &Entry) -> Result<Entry, MergeError> {
+    let mut imported = source.clone();
+    remap_entry_attachments(dest_db, source_db, &mut imported)?;
+    Ok(imported)
+}
+
+fn remap_entry_attachments(
+    dest_db: &mut Database,
+    source_db: &Database,
+    entry: &mut Entry,
+) -> Result<(), MergeError> {
+    remap_attachment_map(dest_db, source_db, &mut entry.attachments)?;
+    if let Some(history) = entry.history.as_mut() {
+        for historical in &mut history.entries {
+            remap_attachment_map(dest_db, source_db, &mut historical.attachments)?;
+        }
+    }
+    Ok(())
+}
+
+fn remap_attachment_map(
+    dest_db: &mut Database,
+    source_db: &Database,
+    attachments: &mut HashMap<String, AttachmentId>,
+) -> Result<(), MergeError> {
+    for source_id in attachments.values_mut() {
+        let source_attachment = source_db
+            .attachments
+            .get(source_id)
+            .ok_or(MergeError::AttachmentNotFound(*source_id))?;
+
+        let dest_id = dest_db
+            .attachments
+            .iter()
+            .find_map(|(id, attachment)| (attachment.data == source_attachment.data).then_some(*id))
+            .unwrap_or_else(|| {
+                let id = AttachmentId::next_free(dest_db);
+                dest_db.attachments.insert(
+                    id,
+                    Attachment {
+                        id,
+                        entries: HashSet::new(),
+                        data: source_attachment.data.clone(),
+                    },
+                );
+                id
+            });
+        *source_id = dest_id;
+    }
+    Ok(())
+}
+
+/// Entry attachment maps are authoritative. Rebuild the inverse reference
+/// index after merge and drop blobs that no current or historical entry uses.
+fn rebuild_attachment_references(db: &mut Database) {
+    let mut references: HashMap<AttachmentId, HashSet<(EntryId, Option<usize>)>> = HashMap::new();
+    for (&entry_id, entry) in &db.entries {
+        for &attachment_id in entry.attachments.values() {
+            references
+                .entry(attachment_id)
+                .or_default()
+                .insert((entry_id, None));
+        }
+        if let Some(history) = &entry.history {
+            for (index, historical) in history.entries.iter().enumerate() {
+                for &attachment_id in historical.attachments.values() {
+                    references
+                        .entry(attachment_id)
+                        .or_default()
+                        .insert((entry_id, Some(index)));
+                }
+            }
+        }
+    }
+
+    db.attachments
+        .retain(|id, attachment| match references.remove(id) {
+            Some(entries) => {
+                attachment.entries = entries;
+                true
+            }
+            None => false,
+        });
 }
 
 /// Get the last update time (modification or location change) of a group, considering its entries and subgroups.
@@ -385,16 +480,18 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 
         let parent_id = source_entry.parent().id();
 
-        let Some(mut parent) = dest_db.group_mut(parent_id) else {
+        if dest_db.group(parent_id).is_none() {
             log.warnings.push(format!(
                 "Cannot add entry {} because its parent group {} does not exist in the destination database.",
                 id, parent_id,
             ));
             continue;
-        };
+        }
 
+        let imported = import_entry(dest_db, source_db, &source_entry)?;
+        let mut parent = dest_db.group_mut(parent_id).expect("parent checked above");
         let mut entry = parent.add_entry_with_id(id);
-        *entry = source_entry.deref().clone();
+        *entry = imported;
 
         log.events.push(MergeEvent {
             target: MergeEventTarget::Entry(id),
@@ -433,14 +530,15 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 
     // Handle entries that exist in both source and destination.
     for &id in dest_entries.intersection(&source_entries) {
+        #[allow(clippy::unwrap_used)] // id is guaranteed to exist in source
+        let source_entry = source_db.entry(id).unwrap();
+        let source_entry = import_entry(dest_db, source_db, &source_entry)?;
+
         #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
         let mut dest_entry = dest_db.entry_mut(id).unwrap();
 
-        #[allow(clippy::unwrap_used)] // id is guaranteed to exist in both dest and source
-        let source_entry = source_db.entry(id).unwrap();
-
         let dest_parent_id = dest_entry.as_ref().parent().id();
-        let source_parent_id = source_entry.parent().id();
+        let source_parent_id = source_entry.parent;
 
         // has the entry moved?
         if dest_parent_id != source_parent_id {
@@ -519,12 +617,14 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 
         if source_last_modification > dest_last_modification {
             // add the previous dest entry to history if it has diverged
-            if let Some(last_history_entry) = merged_history.entries.first() {
-                if have_entries_diverged(&dest_entry, last_history_entry) {
-                    let mut dest_entry_for_history = dest_entry.deref().clone();
-                    dest_entry_for_history.history = None;
-                    merged_history.add_entry(dest_entry_for_history);
-                }
+            let should_archive_dest = merged_history
+                .entries
+                .first()
+                .is_none_or(|last_history_entry| have_entries_diverged(&dest_entry, last_history_entry));
+            if should_archive_dest {
+                let mut dest_entry_for_history = dest_entry.deref().clone();
+                dest_entry_for_history.history = None;
+                merged_history.add_entry(dest_entry_for_history);
             }
 
             // The source entry is more recent than the destination entry. Replace dest with source.
@@ -540,7 +640,9 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             dest_entry.quality_check = source_entry.quality_check;
             dest_entry.previous_parent_group = source_entry.previous_parent_group;
 
-            // TODO: attachments and custom_icons_id
+            dest_entry.attachments = source_entry.attachments.clone();
+
+            // TODO: custom_icons_id
 
             log.events.push(MergeEvent {
                 target: MergeEventTarget::Entry(id),
@@ -674,7 +776,7 @@ fn have_entries_diverged(a: &Entry, b: &Entry) -> bool {
 mod merge_tests {
     use uuid::uuid;
 
-    use crate::db::{fields, EntryId, GroupId, History, Times};
+    use crate::db::{fields, AttachmentId, EntryId, GroupId, History, Times, Value};
     use crate::Database;
 
     const ROOT_GROUP_ID: GroupId = GroupId::from_uuid(uuid!("00000000-0000-0000-0000-000000000001"));
@@ -2172,5 +2274,168 @@ mod merge_tests {
         let merge_result = destination_db.merge(&source_db).unwrap();
         assert_eq!(merge_result.warnings.len(), 3);
         assert_eq!(merge_result.events.len(), 0);
+    }
+
+    #[test]
+    fn merge_imports_attachment_on_new_entry() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+        let entry_id = source_db.root_mut().add_entry().id();
+        source_db
+            .entry_mut(entry_id)
+            .unwrap()
+            .add_attachment("secret.bin", Value::protected(vec![1, 2, 3]));
+
+        destination_db.merge(&source_db).unwrap();
+
+        let entry = destination_db.entry(entry_id).unwrap();
+        let attachment = entry.attachment_by_name("secret.bin").unwrap();
+        assert_eq!(attachment.data.get(), &[1, 2, 3]);
+        assert!(attachment.data.is_protected());
+        assert_eq!(destination_db.num_attachments(), 1);
+    }
+
+    #[test]
+    fn merge_remaps_colliding_attachment_ids() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+
+        sleep();
+        destination_db
+            .entry_mut(ENTRY2_ID)
+            .unwrap()
+            .add_attachment("local.bin", Value::unprotected(vec![4, 5, 6]));
+        destination_db
+            .entry_mut(ENTRY2_ID)
+            .unwrap()
+            .times
+            .last_modification = Some(Times::now());
+        sleep();
+        source_db
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .add_attachment("remote.bin", Value::unprotected(vec![7, 8, 9]));
+        source_db.entry_mut(ENTRY1_ID).unwrap().times.last_modification = Some(Times::now());
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(destination_db.num_attachments(), 2);
+        assert_eq!(
+            destination_db
+                .entry(ENTRY2_ID)
+                .unwrap()
+                .attachment_by_name("local.bin")
+                .unwrap()
+                .data
+                .get(),
+            &[4, 5, 6]
+        );
+        assert_eq!(
+            destination_db
+                .entry(ENTRY1_ID)
+                .unwrap()
+                .attachment_by_name("remote.bin")
+                .unwrap()
+                .data
+                .get(),
+            &[7, 8, 9]
+        );
+    }
+
+    #[test]
+    fn merge_preserves_replaced_attachment_in_history() {
+        let mut destination_db = create_test_database();
+        destination_db
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .add_attachment("old.bin", Value::unprotected(vec![1, 1, 1]));
+        let mut source_db = destination_db.clone();
+
+        sleep();
+        {
+            let mut source_entry = source_db.entry_mut(ENTRY1_ID).unwrap();
+            source_entry.remove_attachment_by_name("old.bin");
+            source_entry.add_attachment("new.bin", Value::unprotected(vec![2, 2, 2]));
+            source_entry.times.last_modification = Some(Times::now());
+        }
+
+        destination_db.merge(&source_db).unwrap();
+
+        let entry = destination_db.entry(ENTRY1_ID).unwrap();
+        assert!(entry.attachment_by_name("old.bin").is_none());
+        assert_eq!(
+            entry.attachment_by_name("new.bin").unwrap().data.get(),
+            &[2, 2, 2]
+        );
+        let old_version = entry
+            .history
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|historical| historical.attachments.contains_key("old.bin"))
+            .expect("destination attachment must survive in history");
+        let old_id = old_version.attachments["old.bin"];
+        assert_eq!(destination_db.attachment(old_id).unwrap().data.get(), &[1, 1, 1]);
+    }
+
+    #[test]
+    fn merge_reuses_equal_attachment_values() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+        sleep();
+        destination_db
+            .entry_mut(ENTRY2_ID)
+            .unwrap()
+            .add_attachment("existing.bin", Value::protected(vec![4, 2]));
+        destination_db
+            .entry_mut(ENTRY2_ID)
+            .unwrap()
+            .times
+            .last_modification = Some(Times::now());
+
+        sleep();
+        source_db
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .add_attachment("same-data.bin", Value::protected(vec![4, 2]));
+        source_db.entry_mut(ENTRY1_ID).unwrap().times.last_modification = Some(Times::now());
+
+        destination_db.merge(&source_db).unwrap();
+
+        assert_eq!(destination_db.num_attachments(), 1);
+        let first = destination_db
+            .entry(ENTRY1_ID)
+            .unwrap()
+            .attachment_by_name("same-data.bin")
+            .unwrap()
+            .id();
+        let second = destination_db
+            .entry(ENTRY2_ID)
+            .unwrap()
+            .attachment_by_name("existing.bin")
+            .unwrap()
+            .id();
+        assert_eq!(first, second);
+        assert_eq!(
+            destination_db.attachment(first).unwrap().entries(false).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn merge_rejects_dangling_source_attachment_reference() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+        let entry_id = source_db.root_mut().add_entry().id();
+        source_db
+            .entries
+            .get_mut(&entry_id)
+            .unwrap()
+            .attachments
+            .insert("missing.bin".into(), AttachmentId::new(99));
+
+        let error = destination_db.merge(&source_db).unwrap_err();
+        assert!(matches!(error, super::MergeError::AttachmentNotFound(_)));
     }
 }
