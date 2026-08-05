@@ -237,6 +237,21 @@ impl EntryRef<'_> {
             .map(move |attachment_id| AttachmentRef::new(self.database, attachment_id))
     }
 
+    /// Get an iterator over attachment names and their values.
+    ///
+    /// Attachment IDs are local to a database and cannot be compared across
+    /// independently loaded copies. Consumers that diff or merge databases
+    /// need the name together with the referenced value to compare entry
+    /// attachment state semantically.
+    pub fn named_attachments(&self) -> impl Iterator<Item = (&str, AttachmentRef<'_>)> {
+        self.attachments.iter().map(move |(name, &attachment_id)| {
+            (
+                name.as_str(),
+                AttachmentRef::new(self.database, attachment_id),
+            )
+        })
+    }
+
     /// Get the custom icon of this entry, if it exists and is a custom icon.
     pub fn custom_icon(&self) -> Option<CustomIconRef<'_>> {
         if let Some(Icon::Custom(custom_icon_id)) = self.icon {
