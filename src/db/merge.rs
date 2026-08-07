@@ -739,6 +739,11 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
     Ok(History { entries })
 }
 
+/// Check if two groups are dissimilar, ignoring their timestamps and pure
+/// UI view state. `is_expanded` and `last_top_visible_entry` are written by
+/// clients (e.g. KeePassXC) without bumping the modification time, so two
+/// otherwise-identical files routinely differ on them with tied timestamps —
+/// treating that as divergence would fail the merge for view-only changes.
 fn have_groups_diverged(a: &Group, b: &Group) -> bool {
     let new_times = Times::default();
 
@@ -747,12 +752,16 @@ fn have_groups_diverged(a: &Group, b: &Group) -> bool {
     a.entries.clear();
     a.groups.clear();
     a.parent = None;
+    a.is_expanded = false;
+    a.last_top_visible_entry = None;
 
     let mut b = b.clone();
     b.times = new_times.clone();
     b.entries.clear();
     b.groups.clear();
     b.parent = None;
+    b.is_expanded = false;
+    b.last_top_visible_entry = None;
 
     !a.eq(&b)
 }
@@ -893,6 +902,40 @@ mod merge_tests {
         // Merging twice in a row, even if the first merge updated the destination group,
         // should not create more changes.
         assert_eq!(destination_db_just_after_merge, destination_db);
+    }
+
+    /// Pure UI view state (IsExpanded, LastTopVisibleEntry) is written by
+    /// clients without bumping modification times — with tied timestamps it
+    /// must not count as divergence and must not fail the merge.
+    #[test]
+    fn test_view_state_only_divergence_is_not_a_merge_error() {
+        let mut destination_db = create_test_database();
+        let mut source_db = destination_db.clone();
+
+        let dest_expanded = destination_db.groups.get(&GROUP1_ID).unwrap().is_expanded;
+        source_db.groups.get_mut(&GROUP1_ID).unwrap().is_expanded = !dest_expanded;
+        source_db
+            .groups
+            .get_mut(&GROUP2_ID)
+            .unwrap()
+            .last_top_visible_entry = Some(ENTRY1_ID);
+
+        let merge_result = destination_db.merge(&source_db).unwrap();
+        assert_eq!(merge_result.warnings.len(), 0);
+        assert_eq!(merge_result.events.len(), 0);
+        // On a tie the destination keeps its own view state.
+        assert_eq!(
+            destination_db.groups.get(&GROUP1_ID).unwrap().is_expanded,
+            dest_expanded
+        );
+        assert_eq!(
+            destination_db
+                .groups
+                .get(&GROUP2_ID)
+                .unwrap()
+                .last_top_visible_entry,
+            None
+        );
     }
 
     /// Test that a new entry in source is added to destination when merging.
