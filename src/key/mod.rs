@@ -109,9 +109,16 @@ fn parse_keyfile(buffer: &[u8]) -> Result<KeyElement, DatabaseKeyError> {
 }
 
 /// A KeePass key, which might consist of a password and/or a keyfile
-#[derive(Debug, Clone, Default, PartialEq, Zeroize, ZeroizeOnDrop)]
+///
+/// The password is not kept. KDBX only ever uses its SHA-256 as one element
+/// of the composite key, so that is what is stored: a caller who unlocks a
+/// database no longer holds a reusable credential for the life of the
+/// session, and a memory dump yields a value that has to be brute-forced
+/// rather than the plaintext the user probably typed somewhere else too.
+#[derive(Clone, Default, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub struct DatabaseKey {
-    password: Option<String>,
+    /// SHA-256 of the password, computed once by [`Self::with_password`].
+    password_hash: Option<KeyElement>,
     keyfile: Option<Vec<u8>>,
     #[cfg(feature = "challenge_response")]
     challenge_response_key: Option<ChallengeResponseKey>,
@@ -119,16 +126,27 @@ pub struct DatabaseKey {
     challenge_response_result: Option<KeyElement>,
 }
 
+/// Redacted by hand. Both fields are key material, and the derived `Debug`
+/// printed them into any log line or panic message that formatted a key.
+impl std::fmt::Debug for DatabaseKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseKey")
+            .field("has_password", &self.password_hash.is_some())
+            .field("has_keyfile", &self.keyfile.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl DatabaseKey {
     pub fn with_password(mut self, password: &str) -> Self {
-        self.password = Some(password.to_string());
+        self.password_hash = Some(calculate_sha256(&[password.as_bytes()]).to_vec());
         self
     }
 
     #[cfg(feature = "utilities")]
-    pub fn with_password_from_prompt(mut self, prompt_message: &str) -> Result<Self, std::io::Error> {
-        self.password = Some(rpassword::prompt_password(prompt_message)?);
-        Ok(self)
+    pub fn with_password_from_prompt(self, prompt_message: &str) -> Result<Self, std::io::Error> {
+        let password = rpassword::prompt_password(prompt_message)?;
+        Ok(self.with_password(&password))
     }
 
     #[cfg(all(feature = "challenge_response", feature = "utilities"))]
@@ -175,8 +193,8 @@ impl DatabaseKey {
     pub(crate) fn get_key_elements(&self) -> Result<KeyElements, DatabaseKeyError> {
         let mut out = Vec::new();
 
-        if let Some(p) = &self.password {
-            out.push(calculate_sha256(&[p.as_bytes()]).to_vec());
+        if let Some(password_hash) = &self.password_hash {
+            out.push(password_hash.clone());
         }
 
         if let Some(ref f) = self.keyfile {
@@ -201,7 +219,7 @@ impl DatabaseKey {
 
     /// Returns true if the database key is not associated with any key component.
     pub fn is_empty(&self) -> bool {
-        if self.password.is_some() || self.keyfile.is_some() {
+        if self.password_hash.is_some() || self.keyfile.is_some() {
             return false;
         }
         #[cfg(feature = "challenge_response")]
@@ -302,7 +320,7 @@ mod key_tests {
         assert_eq!(ke.len(), 1);
 
         assert!(DatabaseKey {
-            password: None,
+            password_hash: None,
             keyfile: None,
             #[cfg(feature = "challenge_response")]
             challenge_response_key: None,
@@ -313,5 +331,26 @@ mod key_tests {
         .is_err());
 
         Ok(())
+    }
+
+    /// The password is a credential the user probably reuses; the hash is
+    /// not. Keeping the plaintext for the life of an unlocked database made
+    /// every memory dump a password disclosure rather than a brute-force
+    /// problem, and nothing needed it: KDBX only ever uses the hash.
+    #[test]
+    fn a_password_is_reduced_to_its_hash_and_never_kept() {
+        let key = DatabaseKey::new().with_password("correct horse battery staple");
+
+        let rendered = format!("{key:?}");
+        assert!(!rendered.contains("correct horse battery staple"));
+        assert!(rendered.contains("has_password: true"));
+
+        let elements = key.get_key_elements().expect("one element");
+        assert_eq!(elements.len(), 1);
+        assert_eq!(
+            elements[0],
+            crate::crypt::calculate_sha256(&[b"correct horse battery staple"]).to_vec(),
+            "the element is exactly what the format asks for"
+        );
     }
 }
