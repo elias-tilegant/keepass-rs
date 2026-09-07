@@ -149,10 +149,7 @@ pub mod cs_opt_autotype_obfuscation {
     where
         D: Deserializer<'de>,
     {
-        match Option::<String>::deserialize(d)?
-            .as_deref()
-            .map(str::trim)
-        {
+        match Option::<String>::deserialize(d)?.as_deref().map(str::trim) {
             None | Some("") | Some("Null") | Some("null") => Ok(None),
             Some("0") | Some("False") | Some("false") => Ok(Some(false)),
             Some("1") | Some("True") | Some("true") => Ok(Some(true)),

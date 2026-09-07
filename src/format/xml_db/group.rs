@@ -107,7 +107,12 @@ impl Group {
         target.previous_parent_group = self.previous_parent_group.map(|u| GroupId::from_uuid(u.0));
         target.tags = self
             .tags
-            .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .map(|t| {
+                t.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
 
         if let Some(cd) = self.custom_data {

@@ -245,10 +245,7 @@ impl EntryRef<'_> {
     /// attachment state semantically.
     pub fn named_attachments(&self) -> impl Iterator<Item = (&str, AttachmentRef<'_>)> {
         self.attachments.iter().map(move |(name, &attachment_id)| {
-            (
-                name.as_str(),
-                AttachmentRef::new(self.database, attachment_id),
-            )
+            (name.as_str(), AttachmentRef::new(self.database, attachment_id))
         })
     }
 

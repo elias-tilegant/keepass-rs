@@ -317,7 +317,11 @@ pub struct AutoType {
     // `True`/`False` causes KeePassXC to reject the file with "invalid
     // number value". The custom serde helper emits 0/1 and accepts both
     // numeric and boolean shapes on read.
-    #[serde(default, with = "cs_opt_autotype_obfuscation", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "cs_opt_autotype_obfuscation",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub data_transfer_obfuscation: Option<bool>,
 
     #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]

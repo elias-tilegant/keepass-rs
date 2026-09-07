@@ -195,6 +195,22 @@ impl Database {
             .map(move |id| CustomIconRef::new(self, *id))
     }
 
+    /// Drop custom icon images that no entry, entry history version, or group
+    /// points at, and refresh the reference index on the ones that stay.
+    ///
+    /// Replacing an entry's icon leaves the previous image behind, so a client
+    /// that refreshes icons in bulk (favicons, for example) grows its vault
+    /// without bound and its icon table drifts away from every other copy.
+    ///
+    /// Call this once a batch of edits is complete. It reads the entry and
+    /// group icon fields, which are authoritative; the `CustomIcon::entries`
+    /// and `groups` sets are a cache that a `track_changes` history version
+    /// never registers itself in. It must not run while an `EntryTrack` is
+    /// still open, because that version's icon reference does not exist yet.
+    pub fn prune_unused_custom_icons(&mut self) {
+        crate::db::merge::rebuild_custom_icon_references(self);
+    }
+
     /// Iterate over all custom icons with mutable access. The provided closure is
     /// called for each `CustomIconMut` and borrows are limited to the closure body.
     pub fn foreach_custom_icon_mut<F>(&mut self, mut f: F)
