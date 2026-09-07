@@ -1252,6 +1252,58 @@ mod merge_tests {
     const ENTRY1_ID: EntryId = EntryId::from_uuid(uuid!("00000000-0000-0000-0000-000000000006"));
     const ENTRY2_ID: EntryId = EntryId::from_uuid(uuid!("00000000-0000-0000-0000-000000000007"));
 
+    /// A caller that resolves a conflict itself has to write the winning
+    /// icon reference before this merge runs, and `set_icon_custom` clears
+    /// the current icon and only then rejects an unknown ID. Adopting the
+    /// image first is the only way to set that reference without losing it.
+    #[test]
+    fn an_adopted_custom_icon_can_be_referenced_here() {
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+
+        let image = vec![0x89, b'P', b'N', b'G', 4, 5, 6];
+        let icon_id = {
+            let mut group = source.group_mut(GROUP1_ID).unwrap();
+            let mut icon = group.set_icon_custom_new(image.clone());
+            icon.name = Some("Vault".to_string());
+            icon.id()
+        };
+
+        assert!(
+            dest.group_mut(GROUP1_ID)
+                .unwrap()
+                .set_icon_custom(icon_id)
+                .is_err(),
+            "the image is not here yet, so the reference cannot be written"
+        );
+
+        assert!(dest.adopt_custom_icon_from(&source, icon_id));
+        dest.group_mut(GROUP1_ID)
+            .unwrap()
+            .set_icon_custom(icon_id)
+            .unwrap();
+
+        let adopted = dest.custom_icon(icon_id).expect("the image is here now");
+        assert_eq!(adopted.data, image);
+        assert_eq!(adopted.name.as_deref(), Some("Vault"));
+        assert_eq!(
+            dest.group(GROUP1_ID).unwrap().icon(),
+            Some(&crate::db::Icon::Custom(icon_id))
+        );
+
+        // Adopting again is a no-op rather than a reset: the reference list
+        // built by `set_icon_custom` above has to survive it.
+        assert!(dest.adopt_custom_icon_from(&source, icon_id));
+        assert_eq!(
+            dest.group(GROUP1_ID).unwrap().icon(),
+            Some(&crate::db::Icon::Custom(icon_id))
+        );
+
+        // An ID neither database holds is reported rather than invented.
+        let empty = Database::new();
+        assert!(!dest.adopt_custom_icon_from(&empty, crate::db::CustomIconId::new()));
+    }
+
     /// A merge copies icon references from source onto destination objects.
     /// The images live in a database-local table, so the destination has to
     /// take a copy or it renders a default icon and loses the image on save.

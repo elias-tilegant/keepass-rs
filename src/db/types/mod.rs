@@ -297,6 +297,38 @@ impl Database {
             .then(move || CustomIconRef::new(self, id))
     }
 
+    /// Copy one custom icon from another database, keeping its ID, so that a
+    /// reference to it can be written here. Returns whether the icon is now
+    /// present. An ID this database already holds is left untouched.
+    ///
+    /// Merging two files means adopting an image the destination has never
+    /// seen *before* the reference to it can be set: `set_icon_custom` clears
+    /// the object's current icon and only then fails on an unknown ID, so
+    /// writing the reference first left the object with no icon at all.
+    ///
+    /// The reference lists are deliberately not copied. They name objects in
+    /// the other database; setting the icon on an object here registers it.
+    pub fn adopt_custom_icon_from(&mut self, source: &Database, id: CustomIconId) -> bool {
+        if self.custom_icons.contains_key(&id) {
+            return true;
+        }
+        let Some(icon) = source.custom_icons.get(&id) else {
+            return false;
+        };
+        self.custom_icons.insert(
+            id,
+            CustomIcon {
+                id,
+                entries: HashSet::new(),
+                groups: HashSet::new(),
+                data: icon.data.clone(),
+                name: icon.name.clone(),
+                last_modification_time: icon.last_modification_time,
+            },
+        );
+        true
+    }
+
     /// Get a mutable reference to the custom icon with the given ID, if it exists
     pub fn custom_icon_mut(&mut self, id: CustomIconId) -> Option<CustomIconMut<'_>> {
         self.custom_icons
