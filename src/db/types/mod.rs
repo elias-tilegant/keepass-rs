@@ -297,9 +297,14 @@ impl Database {
             .then(move || CustomIconRef::new(self, id))
     }
 
-    /// Copy one custom icon from another database, keeping its ID, so that a
-    /// reference to it can be written here. Returns whether the icon is now
-    /// present. An ID this database already holds is left untouched.
+    /// Copy one custom icon from another database so that a reference to it
+    /// can be written here, and return the ID to write.
+    ///
+    /// That is the same ID whenever it is free or already holds this exact
+    /// image, and a fresh one when this database uses it for a *different*
+    /// image: two files can reach the same ID for two pictures, and reusing
+    /// it would silently show the other one. `None` means the source has no
+    /// such icon, which is a dangling reference in that file.
     ///
     /// Merging two files means adopting an image the destination has never
     /// seen *before* the reference to it can be set: `set_icon_custom` clears
@@ -308,17 +313,23 @@ impl Database {
     ///
     /// The reference lists are deliberately not copied. They name objects in
     /// the other database; setting the icon on an object here registers it.
-    pub fn adopt_custom_icon_from(&mut self, source: &Database, id: CustomIconId) -> bool {
-        if self.custom_icons.contains_key(&id) {
-            return true;
-        }
-        let Some(icon) = source.custom_icons.get(&id) else {
-            return false;
+    pub fn adopt_custom_icon_from(&mut self, source: &Database, id: CustomIconId) -> Option<CustomIconId> {
+        let icon = source.custom_icons.get(&id)?;
+        let target = match self.custom_icons.get(&id) {
+            Some(ours) if ours.data == icon.data => return Some(id),
+            Some(_) => {
+                let mut fresh = CustomIconId::new();
+                while self.custom_icons.contains_key(&fresh) || source.custom_icons.contains_key(&fresh) {
+                    fresh = CustomIconId::new();
+                }
+                fresh
+            }
+            None => id,
         };
         self.custom_icons.insert(
-            id,
+            target,
             CustomIcon {
-                id,
+                id: target,
                 entries: HashSet::new(),
                 groups: HashSet::new(),
                 data: icon.data.clone(),
@@ -326,7 +337,7 @@ impl Database {
                 last_modification_time: icon.last_modification_time,
             },
         );
-        true
+        Some(target)
     }
 
     /// Get a mutable reference to the custom icon with the given ID, if it exists

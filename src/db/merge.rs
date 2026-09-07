@@ -1277,7 +1277,7 @@ mod merge_tests {
             "the image is not here yet, so the reference cannot be written"
         );
 
-        assert!(dest.adopt_custom_icon_from(&source, icon_id));
+        assert_eq!(dest.adopt_custom_icon_from(&source, icon_id), Some(icon_id));
         dest.group_mut(GROUP1_ID)
             .unwrap()
             .set_icon_custom(icon_id)
@@ -1293,7 +1293,7 @@ mod merge_tests {
 
         // Adopting again is a no-op rather than a reset: the reference list
         // built by `set_icon_custom` above has to survive it.
-        assert!(dest.adopt_custom_icon_from(&source, icon_id));
+        assert_eq!(dest.adopt_custom_icon_from(&source, icon_id), Some(icon_id));
         assert_eq!(
             dest.group(GROUP1_ID).unwrap().icon(),
             Some(&crate::db::Icon::Custom(icon_id))
@@ -1301,7 +1301,63 @@ mod merge_tests {
 
         // An ID neither database holds is reported rather than invented.
         let empty = Database::new();
-        assert!(!dest.adopt_custom_icon_from(&empty, crate::db::CustomIconId::new()));
+        assert_eq!(
+            dest.adopt_custom_icon_from(&empty, crate::db::CustomIconId::new()),
+            None
+        );
+    }
+
+    /// Two files can reach the same custom icon ID for two different
+    /// pictures. Handing that ID back would give the caller a reference that
+    /// renders the picture it already had, which is the wrong one and looks
+    /// exactly like the choice it just made was ignored.
+    #[test]
+    fn adopting_a_colliding_icon_id_gives_the_image_a_fresh_one() {
+        use std::collections::HashSet;
+
+        use crate::db::{CustomIcon, Icon};
+
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+
+        let ours = vec![0x89, b'P', b'N', b'G', 1];
+        let theirs = vec![0x89, b'P', b'N', b'G', 2];
+        let shared = dest
+            .group_mut(GROUP1_ID)
+            .unwrap()
+            .set_icon_custom_new(ours.clone())
+            .id();
+        source.custom_icons.insert(
+            shared,
+            CustomIcon {
+                id: shared,
+                entries: HashSet::new(),
+                groups: HashSet::new(),
+                data: theirs.clone(),
+                name: None,
+                last_modification_time: None,
+            },
+        );
+
+        let adopted = dest
+            .adopt_custom_icon_from(&source, shared)
+            .expect("the source holds it");
+
+        assert_ne!(adopted, shared, "that id already means another picture");
+        assert_eq!(dest.custom_icon(adopted).unwrap().data, theirs);
+        assert_eq!(
+            dest.custom_icon(shared).unwrap().data,
+            ours,
+            "and the picture that was already here is untouched"
+        );
+        dest.group_mut(GROUP1_ID)
+            .unwrap()
+            .set_icon_custom(adopted)
+            .unwrap();
+        assert_eq!(
+            dest.group(GROUP1_ID).unwrap().icon(),
+            Some(&Icon::Custom(adopted))
+        );
     }
 
     /// A merge copies icon references from source onto destination objects.
