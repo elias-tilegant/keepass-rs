@@ -10,7 +10,7 @@ pub(crate) mod meta;
 pub(crate) mod times;
 pub(crate) mod value;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub use attachment::{Attachment, AttachmentId, AttachmentMut, AttachmentRef};
 pub use autotype::{AutoType, AutoTypeAssociation};
@@ -207,8 +207,43 @@ impl Database {
     /// and `groups` sets are a cache that a `track_changes` history version
     /// never registers itself in. It must not run while an `EntryTrack` is
     /// still open, because that version's icon reference does not exist yet.
+    ///
+    /// Lives here rather than next to the merge that also needs it: the merge
+    /// module is behind the `_merge` feature, and calling into it from the
+    /// default build broke compilation for every consumer that does not
+    /// enable merging.
     pub fn prune_unused_custom_icons(&mut self) {
-        crate::db::merge::rebuild_custom_icon_references(self);
+        let mut entries: HashMap<CustomIconId, HashSet<(EntryId, Option<usize>)>> = HashMap::new();
+        let mut groups: HashMap<CustomIconId, HashSet<GroupId>> = HashMap::new();
+
+        for (&entry_id, entry) in &self.entries {
+            if let Some(Icon::Custom(id)) = entry.icon {
+                entries.entry(id).or_default().insert((entry_id, None));
+            }
+            if let Some(history) = &entry.history {
+                for (index, historical) in history.entries.iter().enumerate() {
+                    if let Some(Icon::Custom(id)) = historical.icon {
+                        entries.entry(id).or_default().insert((entry_id, Some(index)));
+                    }
+                }
+            }
+        }
+        for (&group_id, group) in &self.groups {
+            if let Some(Icon::Custom(id)) = group.icon {
+                groups.entry(id).or_default().insert(group_id);
+            }
+        }
+
+        self.custom_icons.retain(|id, icon| {
+            let entry_refs = entries.remove(id);
+            let group_refs = groups.remove(id);
+            if entry_refs.is_none() && group_refs.is_none() {
+                return false;
+            }
+            icon.entries = entry_refs.unwrap_or_default();
+            icon.groups = group_refs.unwrap_or_default();
+            true
+        });
     }
 
     /// Iterate over all custom icons with mutable access. The provided closure is

@@ -66,14 +66,29 @@ impl Database {
     /// This function will use the UUIDs to detect what entries and groups are the same.
     pub fn merge(&mut self, other: &Database) -> Result<MergeLog, MergeError> {
         let mut log = MergeLog::default();
-        merge_groups(self, other, &mut log)?;
+        // Both databases can use one CustomIconUUID for two different images:
+        // two clients that each added an icon while offline, or a copy
+        // restored from a backup. The merge copies icon *references*, so
+        // without this the source's entries silently resolve to the
+        // destination's image and the source's image is dropped. Give the
+        // colliding ids fresh ones on a copy of the source first, so every
+        // reference that arrives from there can only point at its own image.
+        let deconflicted;
+        let source = match deconflict_custom_icons(self, other) {
+            Some(rewritten) => {
+                deconflicted = rewritten;
+                &deconflicted
+            }
+            None => other,
+        };
+        merge_groups(self, source, &mut log)?;
         // The merge copies icon *references* from source onto destination
         // objects. Copy the images those references point at before the
         // reference index is rebuilt, or the destination ends up with
         // CustomIconUUIDs no client can resolve.
-        adopt_source_custom_icons(self, other);
+        adopt_source_custom_icons(self, source);
         rebuild_attachment_references(self);
-        rebuild_custom_icon_references(self);
+        self.prune_unused_custom_icons();
 
         Ok(log)
     }
@@ -174,8 +189,9 @@ fn rebuild_attachment_references(db: &mut Database) {
 ///
 /// The source UUID is kept whenever it is free, so two databases of the same
 /// lineage converge on one icon table instead of minting a fresh id on every
-/// merge. Equal images are shared, and an id already taken by a *different*
-/// image gets a new one.
+/// merge. Equal images are shared. Ids the two sides use for different images
+/// no longer reach here: [`deconflict_custom_icons`] has already renamed them
+/// on the source side, before any reference was copied.
 fn adopt_source_custom_icons(dest_db: &mut Database, source_db: &Database) {
     let mut translations: HashMap<CustomIconId, Option<CustomIconId>> = HashMap::new();
     for id in referenced_custom_icons(dest_db) {
@@ -238,6 +254,64 @@ fn adopt_source_custom_icons(dest_db: &mut Database, source_db: &Database) {
     }
 }
 
+/// Give the source's custom icons fresh ids wherever the destination already
+/// uses that id for a different image, and retarget every reference in the
+/// source to match: current entries, entry history versions, and groups.
+///
+/// Returns a rewritten copy of the source, or `None` when nothing collides,
+/// which is the ordinary case and the reason this does not clone every time.
+///
+/// This has to happen before `merge_groups`, not after: once references from
+/// both sides sit in one database there is no way left to tell which of them
+/// meant which image.
+fn deconflict_custom_icons(dest_db: &Database, source_db: &Database) -> Option<Database> {
+    let mut translations: HashMap<CustomIconId, CustomIconId> = HashMap::new();
+    for (id, source_icon) in &source_db.custom_icons {
+        let collides = dest_db
+            .custom_icons
+            .get(id)
+            .is_some_and(|dest_icon| dest_icon.data != source_icon.data);
+        if !collides {
+            continue;
+        }
+        let mut fresh = CustomIconId::new();
+        while dest_db.custom_icons.contains_key(&fresh) || source_db.custom_icons.contains_key(&fresh) {
+            fresh = CustomIconId::new();
+        }
+        translations.insert(*id, fresh);
+    }
+    if translations.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = source_db.clone();
+    let retarget = |icon: &mut Option<Icon>| {
+        if let Some(Icon::Custom(id)) = icon {
+            if let Some(fresh) = translations.get(id) {
+                *icon = Some(Icon::Custom(*fresh));
+            }
+        }
+    };
+    for entry in rewritten.entries.values_mut() {
+        retarget(&mut entry.icon);
+        if let Some(history) = entry.history.as_mut() {
+            for historical in &mut history.entries {
+                retarget(&mut historical.icon);
+            }
+        }
+    }
+    for group in rewritten.groups.values_mut() {
+        retarget(&mut group.icon);
+    }
+    for (old_id, fresh) in &translations {
+        if let Some(mut icon) = rewritten.custom_icons.remove(old_id) {
+            icon.id = *fresh;
+            rewritten.custom_icons.insert(*fresh, icon);
+        }
+    }
+    Some(rewritten)
+}
+
 /// Every custom icon id an entry, an entry's history, or a group points at.
 fn referenced_custom_icons(db: &Database) -> HashSet<CustomIconId> {
     let mut referenced = HashSet::new();
@@ -258,43 +332,6 @@ fn referenced_custom_icons(db: &Database) -> HashSet<CustomIconId> {
         note(&group.icon);
     }
     referenced
-}
-
-/// Entry and group icon fields are authoritative. Rebuild the inverse
-/// reference index after a merge and drop images nothing points at, mirroring
-/// what `rebuild_attachment_references` does for attachment blobs.
-pub(crate) fn rebuild_custom_icon_references(db: &mut Database) {
-    let mut entries: HashMap<CustomIconId, HashSet<(EntryId, Option<usize>)>> = HashMap::new();
-    let mut groups: HashMap<CustomIconId, HashSet<GroupId>> = HashMap::new();
-
-    for (&entry_id, entry) in &db.entries {
-        if let Some(Icon::Custom(id)) = entry.icon {
-            entries.entry(id).or_default().insert((entry_id, None));
-        }
-        if let Some(history) = &entry.history {
-            for (index, historical) in history.entries.iter().enumerate() {
-                if let Some(Icon::Custom(id)) = historical.icon {
-                    entries.entry(id).or_default().insert((entry_id, Some(index)));
-                }
-            }
-        }
-    }
-    for (&group_id, group) in &db.groups {
-        if let Some(Icon::Custom(id)) = group.icon {
-            groups.entry(id).or_default().insert(group_id);
-        }
-    }
-
-    db.custom_icons.retain(|id, icon| {
-        let entry_refs = entries.remove(id);
-        let group_refs = groups.remove(id);
-        if entry_refs.is_none() && group_refs.is_none() {
-            return false;
-        }
-        icon.entries = entry_refs.unwrap_or_default();
-        icon.groups = group_refs.unwrap_or_default();
-        true
-    });
 }
 
 /// Get the last update time (modification or location change) of a group, considering its entries and subgroups.
@@ -990,6 +1027,74 @@ mod merge_tests {
             dest.num_custom_icons(),
             1,
             "the same image is stored once, not once per merge"
+        );
+    }
+
+    /// Two clients that each add an icon offline can pick the same
+    /// CustomIconUUID for different images, and so can a copy restored from a
+    /// backup. The merge copies references, so the winning source entry used
+    /// to resolve to the destination's image: the wrong picture, silently,
+    /// with the source's image dropped.
+    #[test]
+    fn merging_an_entry_whose_icon_uuid_collides_keeps_its_own_image() {
+        let dest_image = vec![1, 2, 3];
+        let source_image = vec![9, 8, 7];
+
+        let mut dest = create_test_database();
+        let contested_id = dest
+            .entry_mut(ENTRY2_ID)
+            .unwrap()
+            .set_icon_custom_new(dest_image.clone())
+            .id();
+        dest.entry_mut(ENTRY2_ID).unwrap().times.last_modification =
+            Some(Times::now() + chrono::Duration::seconds(30));
+
+        // Same uuid, different image, on an entry that wins the merge.
+        let mut source = create_test_database();
+        source.custom_icons.insert(
+            contested_id,
+            crate::db::CustomIcon {
+                id: contested_id,
+                entries: Default::default(),
+                groups: Default::default(),
+                data: source_image.clone(),
+                name: None,
+                last_modification_time: None,
+            },
+        );
+        source
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .edit(|e| e.set_unprotected("Title", "renamed remotely"))
+            .set_icon_custom(contested_id)
+            .expect("the icon was just inserted");
+        source.entry_mut(ENTRY1_ID).unwrap().times.last_modification =
+            Some(Times::now() + chrono::Duration::seconds(60));
+
+        dest.merge(&source).expect("merge");
+
+        assert_eq!(
+            dest.entry(ENTRY1_ID)
+                .unwrap()
+                .custom_icon()
+                .expect("the merged entry still resolves an icon")
+                .data,
+            source_image,
+            "the entry that came from the source keeps the source's image"
+        );
+        assert_eq!(
+            dest.entry(ENTRY2_ID)
+                .unwrap()
+                .custom_icon()
+                .expect("the untouched entry still resolves an icon")
+                .data,
+            dest_image,
+            "and the destination's own entry is unchanged"
+        );
+        assert_eq!(
+            dest.num_custom_icons(),
+            2,
+            "one uuid was renamed rather than one image being lost"
         );
     }
 
