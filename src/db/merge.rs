@@ -427,7 +427,16 @@ fn merge_meta(dest_db: &mut Database, source_db: &Database) {
     let dest = &mut dest_db.meta;
     let source = &source_db.meta;
 
-    fn source_is_newer(dest: Option<NaiveDateTime>, source: Option<NaiveDateTime>) -> bool {
+    // A field's own change time decides it. When neither side dates that
+    // field, `SettingsChanged` is what KeePass bumps for the whole block, so
+    // it decides instead; without that fallback a file written by a client
+    // that omits the per-field times could never hand anything over.
+    let fallback = (dest.settings_changed, source.settings_changed);
+    let source_is_newer = move |dest: Option<NaiveDateTime>, source: Option<NaiveDateTime>| {
+        let (dest, source) = match (dest, source) {
+            (None, None) => fallback,
+            pair => pair,
+        };
         match (dest, source) {
             (Some(dest), Some(source)) => source > dest,
             // Only one side dates its change, so that side is the one that
@@ -435,7 +444,7 @@ fn merge_meta(dest_db: &mut Database, source_db: &Database) {
             (None, Some(_)) => true,
             _ => false,
         }
-    }
+    };
 
     if source_is_newer(dest.database_name_changed, source.database_name_changed) {
         dest.database_name = source.database_name.clone();
@@ -474,14 +483,22 @@ fn merge_meta(dest_db: &mut Database, source_db: &Database) {
         dest.master_key_change_force = source.master_key_change_force;
         dest.settings_changed = source.settings_changed;
     }
-    // Custom data carries its own per-item times in KDBX 4.1, but the fields
-    // this crate exposes do not, so a union that prefers what the destination
-    // already has is the most that can be said honestly. It adds what the
-    // other side introduced and changes nothing that exists here.
+    // Custom data is per key, and each item carries its own modification
+    // time, so each is decided on its own. A destination-wins union dropped
+    // every remote edit to a key that already existed here.
+    //
+    // Deletions cannot be carried: KDBX records no tombstone for a custom
+    // data item, so a key the other side removed is indistinguishable from
+    // one it never had, and keeping it is the only non-destructive choice.
     for (key, item) in &source.custom_data {
-        dest.custom_data
-            .entry(key.clone())
-            .or_insert_with(|| item.clone());
+        let ours = dest.custom_data.get(key);
+        let take_theirs = match ours {
+            None => true,
+            Some(ours) => source_is_newer(ours.last_modification_time, item.last_modification_time),
+        };
+        if take_theirs {
+            dest.custom_data.insert(key.clone(), item.clone());
+        }
     }
     // `master_key_changed` is deliberately untouched. It describes the key
     // this file is encrypted with, and the two copies share one.
@@ -828,9 +845,11 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
         dest.enable_autotype = source.enable_autotype;
         dest.enable_searching = source.enable_searching;
         dest.last_top_visible_entry = source.last_top_visible_entry;
-        // Tags are user-authored and were missing from this list, so the
-        // winning side's fields landed while its tags were silently dropped.
+        // Tags and expiry are user-authored and were missing from this list,
+        // so the winning side's fields landed while they were dropped.
         dest.tags = source.tags.clone();
+        dest.times.expiry = source.times.expiry;
+        dest.times.expires = source.times.expires;
 
         log.events.push(MergeEvent {
             target: MergeEventTarget::Group(id),
@@ -1393,6 +1412,119 @@ mod merge_tests {
         dest.merge(&source).expect("merge");
 
         assert_eq!(dest.meta.database_name.as_deref(), Some("Ours"));
+    }
+
+    /// A group's expiry belongs to the version that won, the same as an
+    /// entry's, and was missing from the list.
+    #[test]
+    fn a_newer_group_brings_its_expiry() {
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+        let expiry = Times::now() + chrono::Duration::days(7);
+
+        {
+            let mut group = source.group_mut(GROUP1_ID).unwrap();
+            group.name = "Renamed".into();
+            group.times.expiry = Some(expiry);
+            group.times.expires = Some(true);
+            group.times.last_modification = Some(Times::now() + chrono::Duration::seconds(60));
+        }
+
+        dest.merge(&source).expect("merge");
+
+        let group = dest.group(GROUP1_ID).expect("group");
+        assert_eq!(group.times.expiry, Some(expiry));
+        assert_eq!(group.times.expires, Some(true));
+    }
+
+    /// Settings written by a client that omits the per-field change times
+    /// could never hand anything over: both sides read as undated and the
+    /// destination kept its own. `SettingsChanged` is what KeePass bumps for
+    /// the block, so it decides when nothing more specific does.
+    #[test]
+    fn settings_changed_decides_when_a_field_has_no_time_of_its_own() {
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+        let earlier = Times::now() - chrono::Duration::seconds(120);
+        let later = Times::now() - chrono::Duration::seconds(60);
+
+        dest.meta.database_name = Some("Ours".into());
+        dest.meta.database_name_changed = None;
+        dest.meta.settings_changed = Some(earlier);
+
+        source.meta.database_name = Some("Theirs".into());
+        source.meta.database_name_changed = None;
+        source.meta.settings_changed = Some(later);
+
+        dest.merge(&source).expect("merge");
+
+        assert_eq!(dest.meta.database_name.as_deref(), Some("Theirs"));
+    }
+
+    /// Custom data items carry their own modification time. A
+    /// destination-wins union dropped every remote edit to a key that
+    /// already existed here, which is where other clients keep their own
+    /// per-database state.
+    #[test]
+    fn a_newer_custom_data_item_replaces_ours() {
+        use crate::db::{CustomDataItem, CustomDataValue};
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+        let earlier = Times::now() - chrono::Duration::seconds(120);
+        let later = Times::now() - chrono::Duration::seconds(60);
+
+        dest.meta.custom_data.insert(
+            "Plugin".into(),
+            CustomDataItem {
+                value: Some(CustomDataValue::String("ours".into())),
+                last_modification_time: Some(earlier),
+            },
+        );
+        source.meta.custom_data.insert(
+            "Plugin".into(),
+            CustomDataItem {
+                value: Some(CustomDataValue::String("theirs".into())),
+                last_modification_time: Some(later),
+            },
+        );
+        source.meta.custom_data.insert(
+            "TheirsOnly".into(),
+            CustomDataItem {
+                value: Some(CustomDataValue::String("new".into())),
+                last_modification_time: Some(later),
+            },
+        );
+
+        dest.merge(&source).expect("merge");
+
+        assert_eq!(
+            dest.meta.custom_data.get("Plugin").and_then(|i| i.value.clone()),
+            Some(CustomDataValue::String("theirs".into()))
+        );
+        assert!(dest.meta.custom_data.contains_key("TheirsOnly"));
+
+        // And an older remote item does not overwrite ours.
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+        dest.meta.custom_data.insert(
+            "Plugin".into(),
+            CustomDataItem {
+                value: Some(CustomDataValue::String("ours".into())),
+                last_modification_time: Some(later),
+            },
+        );
+        source.meta.custom_data.insert(
+            "Plugin".into(),
+            CustomDataItem {
+                value: Some(CustomDataValue::String("theirs".into())),
+                last_modification_time: Some(earlier),
+            },
+        );
+        dest.merge(&source).expect("merge");
+        assert_eq!(
+            dest.meta.custom_data.get("Plugin").and_then(|i| i.value.clone()),
+            Some(CustomDataValue::String("ours".into()))
+        );
     }
 
     /// Two copies can agree on an entry's current version and still hold
