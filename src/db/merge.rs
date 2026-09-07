@@ -587,12 +587,24 @@ fn deconflict_custom_icons(dest_db: &Database, source_db: &Database) -> Option<D
 /// has already separated.
 fn merge_custom_icon_metadata(dest_db: &mut Database, source_db: &Database) {
     for (id, source_icon) in &source_db.custom_icons {
-        let Some(dest_icon) = dest_db.custom_icons.get_mut(id) else {
+        // By id when it holds this image, otherwise by the image itself:
+        // adoption shares an image the destination already has under another
+        // id, and matching on the id alone then skipped the newer name that
+        // arrived with it.
+        let target = dest_db
+            .custom_icons
+            .get(id)
+            .filter(|ours| ours.data == source_icon.data)
+            .or_else(|| {
+                dest_db
+                    .custom_icons
+                    .values()
+                    .find(|ours| ours.data == source_icon.data)
+            })
+            .map(|ours| ours.id);
+        let Some(dest_icon) = target.and_then(|target| dest_db.custom_icons.get_mut(&target)) else {
             continue;
         };
-        if dest_icon.data != source_icon.data {
-            continue;
-        }
         // Strictly newer, so a tie keeps the destination, the same way the
         // rest of this merge treats one.
         let source_is_newer = match (
@@ -632,19 +644,20 @@ fn referenced_custom_icons(db: &Database) -> HashSet<CustomIconId> {
     referenced
 }
 
-/// Get the last update time (modification or location change) of a group, considering its entries and subgroups.
+/// The last time anything in this group or anywhere below it was touched.
+///
+/// It is what decides whether a deletion that arrives from the other side is
+/// still current. Looking at direct children only meant a group was removed
+/// together with a grandchild written after the deletion, and that entry was
+/// gone with nothing logged: the deletion could not have known about it.
 fn get_last_update(group: GroupRef<'_>) -> Option<NaiveDateTime> {
-    let last_update = group.times.last_modification.or(group.times.location_changed);
+    let own = group.times.last_modification.or(group.times.location_changed);
 
     group
         .entries()
         .filter_map(|e| e.times.last_modification.or(e.times.location_changed))
-        .chain(
-            group
-                .groups()
-                .filter_map(|g| g.times.last_modification.or(g.times.location_changed)),
-        )
-        .chain(last_update)
+        .chain(group.groups().filter_map(get_last_update))
+        .chain(own)
         .max()
 }
 
@@ -812,7 +825,15 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
             let dest_location_changed = dest.times.location_changed;
             let source_location_changed = source.times.location_changed;
 
-            if let (Some(dlc), Some(slc)) = (dest_location_changed, source_location_changed) {
+            // Strictly newer, either way. A tie is not evidence, and keeping
+            // the destination on one silently discarded a move the other side
+            // made in the same second, so it is reported like a missing
+            // timestamp rather than decided here.
+            let ranked = match (dest_location_changed, source_location_changed) {
+                (Some(dlc), Some(slc)) if slc > dlc || dlc > slc => Some((dlc, slc)),
+                _ => None,
+            };
+            if let Some((dlc, slc)) = ranked {
                 if slc > dlc {
                     // the source group has been moved more recently than the destination group.
                     // try to move the destination group to the new location.
@@ -1363,6 +1384,83 @@ mod merge_tests {
         );
     }
 
+    /// A deletion cannot have known about something written after it. The
+    /// freshness check looked at direct children only, so a group was removed
+    /// together with a grandchild the deletion predates, and that entry was
+    /// gone with nothing logged.
+    #[test]
+    fn a_newer_grandchild_keeps_its_group_from_being_deleted() {
+        use chrono::TimeDelta;
+
+        use crate::db::Times;
+
+        let deleted_at = Times::now() - TimeDelta::minutes(10);
+        let mut dest = create_test_database();
+        // group1 > subgroup1 > entry2, so entry2 is the grandchild.
+        dest.entry_mut(ENTRY2_ID).unwrap().times.last_modification = Some(Times::now());
+        dest.group_mut(GROUP1_ID).unwrap().times.last_modification = Some(deleted_at);
+        dest.group_mut(SUBGROUP1_ID).unwrap().times.last_modification = Some(deleted_at);
+
+        let mut source = dest.clone();
+        source
+            .group_mut(GROUP1_ID)
+            .unwrap()
+            .track_changes()
+            .remove()
+            .unwrap();
+        // The deletion happened before the grandchild was written.
+        for time in source.deleted_objects.values_mut() {
+            *time = Some(deleted_at);
+        }
+
+        dest.merge(&source).unwrap();
+
+        assert!(
+            dest.entry(ENTRY2_ID).is_some(),
+            "an entry written after the deletion is not covered by it"
+        );
+        assert!(dest.group(GROUP1_ID).is_some(), "nor is its group");
+    }
+
+    /// A move nobody can rank decides nothing. Keeping the destination on a
+    /// tie discarded a move the other side made in the same second, and said
+    /// nothing about it, so the caller had no way to ask.
+    #[test]
+    fn a_tied_group_move_is_reported_rather_than_decided() {
+        use chrono::TimeDelta;
+
+        use crate::db::{MergeWarning, Times};
+
+        let tied = Times::now() - TimeDelta::minutes(5);
+        let mut dest = create_test_database();
+        dest.group_mut(SUBGROUP1_ID)
+            .unwrap()
+            .track_changes()
+            .move_to(GROUP2_ID)
+            .unwrap();
+        dest.group_mut(SUBGROUP1_ID).unwrap().times.location_changed = Some(tied);
+
+        let mut source = create_test_database();
+        source
+            .group_mut(SUBGROUP1_ID)
+            .unwrap()
+            .track_changes()
+            .move_to(SUBGROUP2_ID)
+            .unwrap();
+        source.group_mut(SUBGROUP1_ID).unwrap().times.location_changed = Some(tied);
+
+        let log = dest.merge(&source).unwrap();
+
+        assert!(
+            log.warnings.iter().any(|warning| matches!(
+                warning,
+                MergeWarning::AmbiguousGroupMove { group } if *group == SUBGROUP1_ID
+            )),
+            "a tied move has to be reported: {:?}",
+            log.warnings
+        );
+    }
+
     /// Expiry is a setting the user made, not a record of when something
     /// happened. Wiping the whole `Times` block before comparing made two
     /// same-second history versions that differ only in when they expire
@@ -1475,17 +1573,46 @@ mod merge_tests {
             "and the image itself is untouched"
         );
 
+        // Adoption shares an image the destination already holds, under the
+        // id it already had, so a source icon can carry the newer name under
+        // a different id. Matching on the id alone skipped it.
+        use std::collections::HashSet;
+
+        use crate::db::{CustomIcon, CustomIconId};
+
+        let mut renamed_elsewhere = dest.clone();
+        let other_id = CustomIconId::new();
+        assert_ne!(other_id, icon_id, "a different id for the same image");
+        renamed_elsewhere.custom_icons.insert(
+            other_id,
+            CustomIcon {
+                id: other_id,
+                entries: HashSet::new(),
+                groups: HashSet::new(),
+                data: image.clone(),
+                name: Some("Renamed there".to_string()),
+                last_modification_time: Some(Times::now() + TimeDelta::minutes(1)),
+            },
+        );
+        dest.merge(&renamed_elsewhere).unwrap();
+        assert_eq!(
+            dest.custom_icon(icon_id).unwrap().name.as_deref(),
+            Some("Renamed there"),
+            "the name follows the image, not only the id"
+        );
+
         // The other direction: ours is newer, so theirs does not take it.
         let mut source = dest.clone();
         {
             let mut icon = source.custom_icon_mut(icon_id).unwrap();
             icon.name = Some("Stale name".to_string());
             icon.last_modification_time = Some(Times::now() - TimeDelta::minutes(30));
+            let _ = &icon;
         }
         dest.merge(&source).unwrap();
         assert_eq!(
             dest.custom_icon(icon_id).unwrap().name.as_deref(),
-            Some("New name")
+            Some("Renamed there")
         );
     }
 
