@@ -427,16 +427,9 @@ fn merge_meta(dest_db: &mut Database, source_db: &Database) {
     let dest = &mut dest_db.meta;
     let source = &source_db.meta;
 
-    // A field's own change time decides it. When neither side dates that
-    // field, `SettingsChanged` is what KeePass bumps for the whole block, so
-    // it decides instead; without that fallback a file written by a client
-    // that omits the per-field times could never hand anything over.
-    let fallback = (dest.settings_changed, source.settings_changed);
-    let source_is_newer = move |dest: Option<NaiveDateTime>, source: Option<NaiveDateTime>| {
-        let (dest, source) = match (dest, source) {
-            (None, None) => fallback,
-            pair => pair,
-        };
+    // Strictly newer, so a tie keeps the destination. A tie is not evidence,
+    // and keeping the target is what the rest of this merge does with one.
+    fn source_is_newer(dest: Option<NaiveDateTime>, source: Option<NaiveDateTime>) -> bool {
         match (dest, source) {
             (Some(dest), Some(source)) => source > dest,
             // Only one side dates its change, so that side is the one that
@@ -444,7 +437,14 @@ fn merge_meta(dest_db: &mut Database, source_db: &Database) {
             (None, Some(_)) => true,
             _ => false,
         }
-    };
+    }
+
+    // `SettingsChanged` decides the fields KDBX gives no change time of their
+    // own, and only those. An absent per-field time means unknown, while
+    // `SettingsChanged` moves whenever anything in the block changes, so
+    // borrowing it there would hand a value over on the strength of an
+    // unrelated edit.
+    let settings_block_is_theirs = source_is_newer(dest.settings_changed, source.settings_changed);
 
     if source_is_newer(dest.database_name_changed, source.database_name_changed) {
         dest.database_name = source.database_name.clone();
@@ -473,7 +473,7 @@ fn merge_meta(dest_db: &mut Database, source_db: &Database) {
         dest.entry_templates_group = source.entry_templates_group;
         dest.entry_templates_group_changed = source.entry_templates_group_changed;
     }
-    if source_is_newer(dest.settings_changed, source.settings_changed) {
+    if settings_block_is_theirs {
         dest.color = source.color.clone();
         dest.maintenance_history_days = source.maintenance_history_days;
         dest.memory_protection = source.memory_protection.clone();
@@ -494,7 +494,12 @@ fn merge_meta(dest_db: &mut Database, source_db: &Database) {
         let ours = dest.custom_data.get(key);
         let take_theirs = match ours {
             None => true,
-            Some(ours) => source_is_newer(ours.last_modification_time, item.last_modification_time),
+            // Undated on both sides is unknown, not theirs: this copy may
+            // have set the value, and there is nothing here to say otherwise.
+            Some(ours) => match (ours.last_modification_time, item.last_modification_time) {
+                (None, None) => false,
+                (ours, theirs) => source_is_newer(ours, theirs),
+            },
         };
         if take_theirs {
             dest.custom_data.insert(key.clone(), item.clone());
@@ -850,6 +855,9 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
         dest.tags = source.tags.clone();
         dest.times.expiry = source.times.expiry;
         dest.times.expires = source.times.expires;
+        // Where a restore would put this group back. Omitting it meant a
+        // newer side's move to the recycle bin lost its way home.
+        dest.previous_parent_group = source.previous_parent_group;
 
         log.events.push(MergeEvent {
             target: MergeEventTarget::Group(id),
@@ -1442,23 +1450,54 @@ mod merge_tests {
     /// destination kept its own. `SettingsChanged` is what KeePass bumps for
     /// the block, so it decides when nothing more specific does.
     #[test]
-    fn settings_changed_decides_when_a_field_has_no_time_of_its_own() {
+    fn settings_changed_decides_only_the_fields_without_their_own_time() {
         let mut dest = create_test_database();
         let mut source = dest.clone();
         let earlier = Times::now() - chrono::Duration::seconds(120);
         let later = Times::now() - chrono::Duration::seconds(60);
 
+        // No change time of its own in the format, so the block decides it.
+        dest.meta.history_max_items = Some(10);
+        dest.meta.settings_changed = Some(earlier);
+        source.meta.history_max_items = Some(3);
+        source.meta.settings_changed = Some(later);
+
+        // Has one, and neither side set it. The block must not answer for it.
         dest.meta.database_name = Some("Ours".into());
         dest.meta.database_name_changed = None;
-        dest.meta.settings_changed = Some(earlier);
-
         source.meta.database_name = Some("Theirs".into());
         source.meta.database_name_changed = None;
-        source.meta.settings_changed = Some(later);
 
         dest.merge(&source).expect("merge");
 
-        assert_eq!(dest.meta.database_name.as_deref(), Some("Theirs"));
+        assert_eq!(dest.meta.history_max_items, Some(3));
+        assert_eq!(
+            dest.meta.database_name.as_deref(),
+            Some("Ours"),
+            "an unrelated setting changing over there is not evidence about this one"
+        );
+    }
+
+    /// Where a restore would put a group back. It was missing from the
+    /// winning group's field list, so a newer side's move to the recycle bin
+    /// arrived without its way home.
+    #[test]
+    fn a_newer_group_brings_its_previous_parent() {
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+
+        {
+            let mut group = source.group_mut(SUBGROUP1_ID).unwrap();
+            group.previous_parent_group = Some(GROUP2_ID);
+            group.times.last_modification = Some(Times::now() + chrono::Duration::seconds(60));
+        }
+
+        dest.merge(&source).expect("merge");
+
+        assert_eq!(
+            dest.group(SUBGROUP1_ID).unwrap().previous_parent_group,
+            Some(GROUP2_ID)
+        );
     }
 
     /// Custom data items carry their own modification time. A
@@ -1520,6 +1559,26 @@ mod merge_tests {
                 last_modification_time: Some(earlier),
             },
         );
+        dest.merge(&source).expect("merge");
+        assert_eq!(
+            dest.meta.custom_data.get("Plugin").and_then(|i| i.value.clone()),
+            Some(CustomDataValue::String("ours".into()))
+        );
+
+        // Undated on both sides is unknown, not theirs: this copy may have
+        // set the value, and nothing here says otherwise.
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+        for (db, value) in [(&mut dest, "ours"), (&mut source, "theirs")] {
+            db.meta.custom_data.insert(
+                "Plugin".into(),
+                CustomDataItem {
+                    value: Some(CustomDataValue::String(value.into())),
+                    last_modification_time: None,
+                },
+            );
+        }
+        source.meta.settings_changed = Some(later);
         dest.merge(&source).expect("merge");
         assert_eq!(
             dest.meta.custom_data.get("Plugin").and_then(|i| i.value.clone()),
