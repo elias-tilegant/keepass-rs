@@ -8,8 +8,8 @@ use thiserror::Error;
 
 use crate::{
     db::{
-        Attachment, AttachmentId, CustomIcon, CustomIconId, Entry, EntryId, Group, GroupId, GroupRef, History,
-        Icon, MoveGroupError, Times,
+        Attachment, AttachmentId, CustomIcon, CustomIconId, Entry, EntryId, Group, GroupId, History, Icon,
+        MoveGroupError, Times,
     },
     Database,
 };
@@ -586,7 +586,15 @@ fn deconflict_custom_icons(dest_db: &Database, source_db: &Database) -> Option<D
 /// image under the same id is a different icon, which the deconfliction pass
 /// has already separated.
 fn merge_custom_icon_metadata(dest_db: &mut Database, source_db: &Database) {
-    for (id, source_icon) in &source_db.custom_icons {
+    // Only icons something in the source actually points at. An orphan there
+    // is about to be pruned, and letting one rename a live image here handed
+    // a picture the name of a discarded one.
+    let referenced = referenced_custom_icons(source_db);
+    for (id, source_icon) in source_db
+        .custom_icons
+        .iter()
+        .filter(|(id, _)| referenced.contains(id))
+    {
         // By id when it holds this image, otherwise by the image itself:
         // adoption shares an image the destination already has under another
         // id, and matching on the id alone then skipped the newer name that
@@ -644,21 +652,49 @@ fn referenced_custom_icons(db: &Database) -> HashSet<CustomIconId> {
     referenced
 }
 
-/// The last time anything in this group or anywhere below it was touched.
+/// The last time anything in each group, or anywhere below it, was touched.
 ///
-/// It is what decides whether a deletion that arrives from the other side is
-/// still current. Looking at direct children only meant a group was removed
-/// together with a grandchild written after the deletion, and that entry was
-/// gone with nothing logged: the deletion could not have known about it.
-fn get_last_update(group: GroupRef<'_>) -> Option<NaiveDateTime> {
-    let own = group.times.last_modification.or(group.times.location_changed);
+/// It is what decides whether a deletion arriving from the other side is
+/// still current, and the deletion loops ask it for every tombstoned group.
+/// Looking at direct children only meant a group was removed together with a
+/// grandchild written after the deletion, and that entry was gone with
+/// nothing logged: the deletion could not have known about it.
+///
+/// Computed for the whole database in one pass rather than per group. Walking
+/// each subtree on demand re-walked the same groups, so a deleted chain of n
+/// cost n(n+1)/2, and the recursion went n deep on a file whose depth nobody
+/// here controls.
+fn subtree_last_updates(db: &Database) -> HashMap<GroupId, Option<NaiveDateTime>> {
+    let mut order: Vec<GroupId> = Vec::with_capacity(db.groups.len());
+    let mut stack = vec![db.root().id()];
+    while let Some(id) = stack.pop() {
+        order.push(id);
+        if let Some(group) = db.group(id) {
+            stack.extend(group.groups().map(|child| child.id()));
+        }
+    }
 
-    group
-        .entries()
-        .filter_map(|e| e.times.last_modification.or(e.times.location_changed))
-        .chain(group.groups().filter_map(get_last_update))
-        .chain(own)
-        .max()
+    let mut last: HashMap<GroupId, Option<NaiveDateTime>> = HashMap::with_capacity(order.len());
+    // A child is always pushed after its parent, so walking the order
+    // backwards reaches every child before the parent that needs it.
+    for id in order.into_iter().rev() {
+        let Some(group) = db.group(id) else {
+            continue;
+        };
+        let own = group.times.last_modification.or(group.times.location_changed);
+        let max = group
+            .entries()
+            .filter_map(|e| e.times.last_modification.or(e.times.location_changed))
+            .chain(
+                group
+                    .groups()
+                    .filter_map(|child| last.get(&child.id()).copied().flatten()),
+            )
+            .chain(own)
+            .max();
+        last.insert(id, max);
+    }
+    last
 }
 
 /// Merge groups from `source` into `dest`, appending to a log of the merge process.
@@ -667,17 +703,16 @@ fn get_last_update(group: GroupRef<'_>) -> Option<NaiveDateTime> {
 fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog) -> Result<(), MergeError> {
     let dest_groups = dest_db.groups.keys().cloned().collect::<HashSet<_>>();
     let source_groups = source_db.groups.keys().cloned().collect::<HashSet<_>>();
+    let source_last_updates = subtree_last_updates(source_db);
+    let dest_last_updates = subtree_last_updates(dest_db);
 
     // Handle groups that exist only in source and might need to be added.
     let mut groups_to_add = HashSet::new();
     for &id in source_groups.difference(&dest_groups) {
-        #[allow(clippy::unwrap_used)] // id is guaranteed to exist
-        let source = source_db.group(id).unwrap();
-
         // was the group deleted in dest?
         if let Some(deletion_time) = dest_db.deleted_objects.get(&id.uuid()) {
             // get the last modification time of the group in source.
-            let source_last_update = get_last_update(source);
+            let source_last_update = source_last_updates.get(&id).copied().flatten();
 
             // compare deletion time and last update time to decide whether to re-add the group
             match (deletion_time, source_last_update) {
@@ -768,12 +803,9 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
     // Handle groups that exist only in destination. These groups might need to be deleted.
     let mut to_delete = Vec::new();
     for &id in dest_groups.difference(&source_groups) {
-        #[allow(clippy::unwrap_used)] // id is guaranteed to exist
-        let dest = dest_db.group_mut(id).unwrap();
-
         // was the group deleted in source?
         if let Some(deletion_time) = source_db.deleted_objects.get(&id.uuid()) {
-            let dest_last_updated = get_last_update(dest.as_ref());
+            let dest_last_updated = dest_last_updates.get(&id).copied().flatten();
             if let (Some(deletion_time), Some(dest_last_updated)) = (deletion_time, dest_last_updated) {
                 // if the group was deleted and then later modified in dest, do not delete it
                 if *deletion_time < dest_last_updated {
@@ -1396,10 +1428,27 @@ mod merge_tests {
 
         let deleted_at = Times::now() - TimeDelta::minutes(10);
         let mut dest = create_test_database();
-        // group1 > subgroup1 > entry2, so entry2 is the grandchild.
-        dest.entry_mut(ENTRY2_ID).unwrap().times.last_modification = Some(Times::now());
-        dest.group_mut(GROUP1_ID).unwrap().times.last_modification = Some(deleted_at);
-        dest.group_mut(SUBGROUP1_ID).unwrap().times.last_modification = Some(deleted_at);
+        // group1 > subgroup1 > deeper > entry, four levels below the group
+        // whose deletion arrives, so a check that stops early cannot see it.
+        let deeper = dest
+            .group_mut(SUBGROUP1_ID)
+            .unwrap()
+            .add_group()
+            .edit(|g| g.name = "deeper".to_string())
+            .id();
+        let deep_entry = dest
+            .group_mut(deeper)
+            .unwrap()
+            .add_entry()
+            .edit(|e| e.set_unprotected("Title", "written later"))
+            .id();
+        for id in [GROUP1_ID, SUBGROUP1_ID, deeper] {
+            dest.group_mut(id).unwrap().times.last_modification = Some(deleted_at);
+        }
+        for id in [ENTRY1_ID, ENTRY2_ID] {
+            dest.entry_mut(id).unwrap().times.last_modification = Some(deleted_at);
+        }
+        dest.entry_mut(deep_entry).unwrap().times.last_modification = Some(Times::now());
 
         let mut source = dest.clone();
         source
@@ -1416,10 +1465,32 @@ mod merge_tests {
         dest.merge(&source).unwrap();
 
         assert!(
-            dest.entry(ENTRY2_ID).is_some(),
+            dest.entry(deep_entry).is_some(),
             "an entry written after the deletion is not covered by it"
         );
         assert!(dest.group(GROUP1_ID).is_some(), "nor is its group");
+
+        // A deletion that really is the last word still removes the branch.
+        let mut dest = create_test_database();
+        for id in [GROUP1_ID, SUBGROUP1_ID] {
+            dest.group_mut(id).unwrap().times.last_modification = Some(deleted_at);
+        }
+        dest.entry_mut(ENTRY2_ID).unwrap().times.last_modification = Some(deleted_at);
+        let mut source = dest.clone();
+        source
+            .group_mut(GROUP1_ID)
+            .unwrap()
+            .track_changes()
+            .remove()
+            .unwrap();
+
+        dest.merge(&source).unwrap();
+
+        assert!(
+            dest.group(GROUP1_ID).is_none(),
+            "nothing was touched after it, so the deletion stands"
+        );
+        assert!(dest.entry(ENTRY2_ID).is_none(), "and takes its entry with it");
     }
 
     /// A move nobody can rank decides nothing. Keeping the destination on a
@@ -1458,6 +1529,21 @@ mod merge_tests {
             )),
             "a tied move has to be reported: {:?}",
             log.warnings
+        );
+        assert_eq!(
+            dest.group(SUBGROUP1_ID)
+                .unwrap()
+                .parent()
+                .map(|parent| parent.id()),
+            Some(GROUP2_ID),
+            "and nothing moves on the strength of a tie"
+        );
+        assert!(
+            !log.events
+                .iter()
+                .any(|event| matches!(event.event_type, crate::db::MergeEventType::LocationUpdated)),
+            "so no move is logged either: {:?}",
+            log.events
         );
     }
 
@@ -1576,29 +1662,52 @@ mod merge_tests {
         // Adoption shares an image the destination already holds, under the
         // id it already had, so a source icon can carry the newer name under
         // a different id. Matching on the id alone skipped it.
-        use std::collections::HashSet;
-
-        use crate::db::{CustomIcon, CustomIconId};
-
         let mut renamed_elsewhere = dest.clone();
-        let other_id = CustomIconId::new();
+        let other_id = {
+            let mut group = renamed_elsewhere.group_mut(GROUP2_ID).unwrap();
+            // A real second group pointing at the same picture under an id of
+            // its own, which is what a previous deconfliction leaves behind.
+            group.times.last_modification = Some(Times::now() + TimeDelta::minutes(1));
+            let mut icon = group.set_icon_custom_new(image.clone());
+            icon.name = Some("Renamed there".to_string());
+            icon.last_modification_time = Some(Times::now() + TimeDelta::minutes(1));
+            icon.id()
+        };
         assert_ne!(other_id, icon_id, "a different id for the same image");
-        renamed_elsewhere.custom_icons.insert(
-            other_id,
-            CustomIcon {
-                id: other_id,
-                entries: HashSet::new(),
-                groups: HashSet::new(),
-                data: image.clone(),
-                name: Some("Renamed there".to_string()),
-                last_modification_time: Some(Times::now() + TimeDelta::minutes(1)),
-            },
-        );
         dest.merge(&renamed_elsewhere).unwrap();
         assert_eq!(
             dest.custom_icon(icon_id).unwrap().name.as_deref(),
             Some("Renamed there"),
             "the name follows the image, not only the id"
+        );
+
+        // An icon nothing in the other file points at is about to be pruned
+        // there. Letting it rename a live picture here handed that picture
+        // the name of a discarded one.
+        let mut orphan_rename = dest.clone();
+        {
+            use std::collections::HashSet;
+
+            use crate::db::{CustomIcon, CustomIconId};
+
+            let orphan = CustomIconId::new();
+            orphan_rename.custom_icons.insert(
+                orphan,
+                CustomIcon {
+                    id: orphan,
+                    entries: HashSet::new(),
+                    groups: HashSet::new(),
+                    data: image.clone(),
+                    name: Some("Discarded".to_string()),
+                    last_modification_time: Some(Times::now() + TimeDelta::minutes(5)),
+                },
+            );
+        }
+        dest.merge(&orphan_rename).unwrap();
+        assert_eq!(
+            dest.custom_icon(icon_id).unwrap().name.as_deref(),
+            Some("Renamed there"),
+            "an orphan does not get to rename anything"
         );
 
         // The other direction: ours is newer, so theirs does not take it.
