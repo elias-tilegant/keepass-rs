@@ -896,6 +896,18 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
                 // An entry was updated without updating the last modification timestamp.
                 return Err(MergeError::EntryModificationTimeNotUpdated(id));
             }
+            // The current versions agree, but their archives need not. A
+            // version one side never received is still a version, and
+            // returning here dropped it: the next save writes only what this
+            // database holds, so the other side's copy went with it.
+            let merged_history = merge_history(
+                dest_entry.history.as_ref().unwrap_or(&History::default()),
+                source_entry.history.as_ref().unwrap_or(&History::default()),
+                log,
+            )?;
+            if dest_entry.history.as_ref() != Some(&merged_history) {
+                dest_entry.history = Some(merged_history);
+            }
             continue;
         }
 
@@ -1157,6 +1169,53 @@ mod merge_tests {
             1,
             "the same image is stored once, not once per merge"
         );
+    }
+
+    /// Two copies can agree on an entry's current version and still hold
+    /// different archives: one side edited and undid it, or synced against a
+    /// third copy. Returning early on equal current versions dropped the
+    /// archive the other side had, and the next save wrote only what this
+    /// database held, so the version was gone for good.
+    #[test]
+    fn equal_current_versions_still_union_their_histories() {
+        let mut dest = create_test_database();
+        let shared = Times::now() - chrono::Duration::seconds(600);
+        dest.entry_mut(ENTRY1_ID).unwrap().times.last_modification = Some(shared);
+
+        let mut source = dest.clone();
+
+        let ours = Times::now() - chrono::Duration::seconds(300);
+        let theirs = Times::now() - chrono::Duration::seconds(200);
+        add_history_version(&mut dest, ENTRY1_ID, "only here", ours);
+        add_history_version(&mut source, ENTRY1_ID, "only there", theirs);
+
+        dest.merge(&source).expect("merge");
+
+        let notes: Vec<String> = dest
+            .entry(ENTRY1_ID)
+            .unwrap()
+            .history
+            .as_ref()
+            .expect("history survives")
+            .get_entries()
+            .iter()
+            .filter_map(|version| version.get("Notes").map(ToOwned::to_owned))
+            .collect();
+        assert!(notes.contains(&"only here".to_string()), "{notes:?}");
+        assert!(notes.contains(&"only there".to_string()), "{notes:?}");
+    }
+
+    /// Append one archived version with a chosen timestamp.
+    fn add_history_version(db: &mut Database, id: EntryId, notes: &str, at: chrono::NaiveDateTime) {
+        let mut version = std::ops::Deref::deref(&db.entry(id).expect("entry")).clone();
+        version.set_unprotected("Notes", notes);
+        version.times.last_modification = Some(at);
+        version.history = None;
+        db.entry_mut(id)
+            .expect("entry")
+            .history
+            .get_or_insert_default()
+            .add_entry(version);
     }
 
     /// Two clients that each add an icon offline can pick the same
