@@ -210,6 +210,8 @@ impl Database {
             None => other,
         };
         merge_groups(self, source, &mut log)?;
+        adopt_orphan_tombstones(self, source);
+        merge_meta(self, source);
         // The merge copies icon *references* from source onto destination
         // objects. Copy the images those references point at before the
         // reference index is rebuilt, or the destination ends up with
@@ -380,6 +382,109 @@ fn adopt_source_custom_icons(dest_db: &mut Database, source_db: &Database) {
     for group in dest_db.groups.values_mut() {
         retarget(&mut group.icon);
     }
+}
+
+/// Take the tombstones of objects neither database still holds.
+///
+/// The loops above copy a tombstone only while the destination still contains
+/// the object it deletes, which is what turns a remote deletion into a local
+/// one. A deletion both sides have already applied has no object left to
+/// find, so its record was dropped, and a third copy that still holds the
+/// object could then resurrect it on its next sync. A tombstone is the only
+/// evidence that a deletion happened at all.
+///
+/// An object the destination still holds is left alone: the loops above
+/// already decided that case, including the re-created-after-deletion one.
+fn adopt_orphan_tombstones(dest_db: &mut Database, source_db: &Database) {
+    for (&uuid, &deletion_time) in &source_db.deleted_objects {
+        let still_present = dest_db.entries.contains_key(&EntryId::from_uuid(uuid))
+            || dest_db.groups.contains_key(&GroupId::from_uuid(uuid));
+        if still_present {
+            continue;
+        }
+        match dest_db.deleted_objects.get(&uuid) {
+            // Keep the later record: the same object can be deleted, restored
+            // elsewhere and deleted again.
+            Some(&existing) if existing >= deletion_time => {}
+            _ => {
+                dest_db.deleted_objects.insert(uuid, deletion_time);
+            }
+        }
+    }
+}
+
+/// Merge database-level settings, field by field, by their own change times.
+///
+/// Nothing merged these at all: the destination's `Meta` survived every merge
+/// untouched, so a rename of the database, a changed recycle-bin setting or a
+/// changed history limit made on another machine was dropped the moment the
+/// two copies met, and the local values were then uploaded over them.
+///
+/// KDBX records a change time beside each of these for exactly this purpose.
+/// Where a field has its own, it decides that field; the rest follow
+/// `SettingsChanged`, which is what KeePass bumps when they are edited.
+fn merge_meta(dest_db: &mut Database, source_db: &Database) {
+    let dest = &mut dest_db.meta;
+    let source = &source_db.meta;
+
+    fn source_is_newer(dest: Option<NaiveDateTime>, source: Option<NaiveDateTime>) -> bool {
+        match (dest, source) {
+            (Some(dest), Some(source)) => source > dest,
+            // Only one side dates its change, so that side is the one that
+            // recorded making it.
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
+    if source_is_newer(dest.database_name_changed, source.database_name_changed) {
+        dest.database_name = source.database_name.clone();
+        dest.database_name_changed = source.database_name_changed;
+    }
+    if source_is_newer(
+        dest.database_description_changed,
+        source.database_description_changed,
+    ) {
+        dest.database_description = source.database_description.clone();
+        dest.database_description_changed = source.database_description_changed;
+    }
+    if source_is_newer(dest.default_username_changed, source.default_username_changed) {
+        dest.default_username = source.default_username.clone();
+        dest.default_username_changed = source.default_username_changed;
+    }
+    if source_is_newer(dest.recyclebin_changed, source.recyclebin_changed) {
+        dest.recyclebin_enabled = source.recyclebin_enabled;
+        dest.recyclebin_uuid = source.recyclebin_uuid;
+        dest.recyclebin_changed = source.recyclebin_changed;
+    }
+    if source_is_newer(
+        dest.entry_templates_group_changed,
+        source.entry_templates_group_changed,
+    ) {
+        dest.entry_templates_group = source.entry_templates_group;
+        dest.entry_templates_group_changed = source.entry_templates_group_changed;
+    }
+    if source_is_newer(dest.settings_changed, source.settings_changed) {
+        dest.color = source.color.clone();
+        dest.maintenance_history_days = source.maintenance_history_days;
+        dest.memory_protection = source.memory_protection.clone();
+        dest.history_max_items = source.history_max_items;
+        dest.history_max_size = source.history_max_size;
+        dest.master_key_change_rec = source.master_key_change_rec;
+        dest.master_key_change_force = source.master_key_change_force;
+        dest.settings_changed = source.settings_changed;
+    }
+    // Custom data carries its own per-item times in KDBX 4.1, but the fields
+    // this crate exposes do not, so a union that prefers what the destination
+    // already has is the most that can be said honestly. It adds what the
+    // other side introduced and changes nothing that exists here.
+    for (key, item) in &source.custom_data {
+        dest.custom_data
+            .entry(key.clone())
+            .or_insert_with(|| item.clone());
+    }
+    // `master_key_changed` is deliberately untouched. It describes the key
+    // this file is encrypted with, and the two copies share one.
 }
 
 /// Give the source's custom icons fresh ids wherever the destination already
@@ -723,6 +828,9 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
         dest.enable_autotype = source.enable_autotype;
         dest.enable_searching = source.enable_searching;
         dest.last_top_visible_entry = source.last_top_visible_entry;
+        // Tags are user-authored and were missing from this list, so the
+        // winning side's fields landed while its tags were silently dropped.
+        dest.tags = source.tags.clone();
 
         log.events.push(MergeEvent {
             target: MergeEventTarget::Group(id),
@@ -957,6 +1065,12 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             dest_entry.override_url = source_entry.override_url.clone();
             dest_entry.quality_check = source_entry.quality_check;
             dest_entry.previous_parent_group = source_entry.previous_parent_group;
+            // Expiry is part of the version that won, not of the object. It
+            // was missing from this list, so a newer remote that set or
+            // cleared an expiry date had that change dropped while the rest
+            // of its fields landed.
+            dest_entry.times.expiry = source_entry.times.expiry;
+            dest_entry.times.expires = source_entry.times.expires;
 
             dest_entry.attachments = source_entry.attachments.clone();
 
@@ -1169,6 +1283,116 @@ mod merge_tests {
             1,
             "the same image is stored once, not once per merge"
         );
+    }
+
+    /// The field list that copies a winning group left tags out, so a rename
+    /// landed while the tags that came with it were dropped.
+    #[test]
+    fn a_newer_group_brings_its_tags() {
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+
+        {
+            let mut group = source.group_mut(GROUP1_ID).unwrap();
+            group.name = "Renamed".into();
+            group.tags = vec!["shared".into(), "billing".into()];
+            group.times.last_modification = Some(Times::now() + chrono::Duration::seconds(60));
+        }
+
+        dest.merge(&source).expect("merge");
+
+        let group = dest.group(GROUP1_ID).expect("group");
+        assert_eq!(group.name, "Renamed");
+        assert_eq!(group.tags, vec!["shared".to_string(), "billing".to_string()]);
+    }
+
+    /// Same shape for entries: expiry belongs to the version that won, and
+    /// was missing from the list, so setting an expiry date on another
+    /// machine was dropped while the rest of that edit landed.
+    #[test]
+    fn a_newer_entry_brings_its_expiry() {
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+
+        let expiry = Times::now() + chrono::Duration::days(30);
+        {
+            let mut entry = source.entry_mut(ENTRY1_ID).unwrap();
+            entry.set_unprotected("Title", "renamed remotely");
+            entry.times.expiry = Some(expiry);
+            entry.times.expires = Some(true);
+            entry.times.last_modification = Some(Times::now() + chrono::Duration::seconds(60));
+        }
+
+        dest.merge(&source).expect("merge");
+
+        let entry = dest.entry(ENTRY1_ID).expect("entry");
+        assert_eq!(entry.times.expiry, Some(expiry));
+        assert_eq!(entry.times.expires, Some(true));
+    }
+
+    /// A deletion both copies have already applied leaves no object to find,
+    /// so its record was dropped. The record is the only evidence the
+    /// deletion happened, and without it a third copy that still holds the
+    /// object resurrects it on its next sync.
+    #[test]
+    fn a_tombstone_survives_when_both_copies_already_deleted_the_object() {
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+        let deleted_at = Times::now() - chrono::Duration::seconds(60);
+
+        for db in [&mut dest, &mut source] {
+            db.entry_mut(ENTRY1_ID).unwrap().remove();
+            db.deleted_objects.insert(ENTRY1_ID.uuid(), Some(deleted_at));
+        }
+        // Only the source records it; the destination merely dropped the
+        // entry, as an older client would have.
+        dest.deleted_objects.remove(&ENTRY1_ID.uuid());
+
+        dest.merge(&source).expect("merge");
+
+        assert_eq!(
+            dest.deleted_objects.get(&ENTRY1_ID.uuid()),
+            Some(&Some(deleted_at)),
+            "the deletion has to stay recorded for the next copy to see"
+        );
+    }
+
+    /// Database settings were never merged at all: the destination's Meta
+    /// survived every merge untouched, so a rename or a changed limit made on
+    /// another machine was dropped the moment the two copies met.
+    #[test]
+    fn newer_database_settings_are_taken_from_the_other_copy() {
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+
+        let earlier = Times::now() - chrono::Duration::seconds(120);
+        let later = Times::now() - chrono::Duration::seconds(60);
+        dest.meta.database_name = Some("Ours".into());
+        dest.meta.database_name_changed = Some(earlier);
+        dest.meta.settings_changed = Some(earlier);
+        dest.meta.history_max_items = Some(10);
+
+        source.meta.database_name = Some("Theirs".into());
+        source.meta.database_name_changed = Some(later);
+        source.meta.settings_changed = Some(later);
+        source.meta.history_max_items = Some(0);
+
+        dest.merge(&source).expect("merge");
+
+        assert_eq!(dest.meta.database_name.as_deref(), Some("Theirs"));
+        assert_eq!(dest.meta.history_max_items, Some(0));
+
+        // And the other direction leaves ours alone.
+        let mut dest = create_test_database();
+        let mut source = dest.clone();
+        dest.meta.database_name = Some("Ours".into());
+        dest.meta.database_name_changed = Some(later);
+        source.meta.database_name = Some("Theirs".into());
+        source.meta.database_name_changed = Some(earlier);
+
+        dest.merge(&source).expect("merge");
+
+        assert_eq!(dest.meta.database_name.as_deref(), Some("Ours"));
     }
 
     /// Two copies can agree on an entry's current version and still hold
