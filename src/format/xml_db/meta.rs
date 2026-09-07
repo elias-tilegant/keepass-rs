@@ -353,7 +353,7 @@ struct CustomDataItem {
     key: String,
     value: CustomDataValue,
 
-    // See note in `meta.rs` — `Option<Timestamp>` must skip when None or
+    // See note in `meta.rs` - `Option<Timestamp>` must skip when None or
     // KeePass2 fails to parse the empty `<LastModificationTime/>` as
     // base64 ticks. CustomData entries from KeePass plugins frequently
     // lack a timestamp, so this matters in real vaults.
@@ -554,7 +554,7 @@ mod tests {
 
         let serialized = quick_xml::se::to_string(&cd).unwrap();
 
-        // Item 2's `last_modification_time` is None — must be skipped from
+        // Item 2's `last_modification_time` is None - must be skipped from
         // the XML entirely (no empty `<LastModificationTime/>`), otherwise
         // KeePass2 fails to parse the empty body as base64 ticks.
         assert_eq!(

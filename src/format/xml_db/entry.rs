@@ -22,7 +22,7 @@ pub struct Entry {
     #[serde(rename = "UUID")]
     pub uuid: UUID,
 
-    // See note in `meta.rs` — every Option needs `skip_serializing_if` so
+    // See note in `meta.rs` - every Option needs `skip_serializing_if` so
     // we don't emit `<Tag/>` placeholders that other KeePass clients reject
     // as malformed numbers / base64 / dateTime values.
     #[serde(

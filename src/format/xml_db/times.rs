@@ -10,7 +10,7 @@ use crate::format::xml_db::{
 pub struct Times {
     // Every Option here uses `skip_serializing_if = "Option::is_none"` so that
     // a `None` is omitted from the XML entirely. Otherwise the cs_opt_* helpers
-    // emit `<Tag/>` for None — KeePass2 / KeePassXC then try to parse that as
+    // emit `<Tag/>` for None - KeePass2 / KeePassXC then try to parse that as
     // a dateTime / number / bool and fail with "Invalid number value" /
     // "Invalid Base64 string". See keepass-rs interop bug investigation.
     #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]

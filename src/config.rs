@@ -493,7 +493,7 @@ mod kdf_dump_tests {
     /// written by `keepass-rs` could not be opened by KeePass2 ("Unknown key
     /// derivation function") or KeePassXC ("Invalid number value"). The
     /// correct, spec-defined AES-KDF UUID is `c9d9f39a-628a-4460-bf74-
-    /// 0d08c18a4fea` — the same value `KDF_AES_KDBX3` already held.
+    /// 0d08c18a4fea` - the same value `KDF_AES_KDBX3` already held.
     #[test]
     fn aes_kdf_dumps_standard_uuid() {
         let cfg = KdfConfig::Aes { rounds: 60_000 };
@@ -506,7 +506,7 @@ mod kdf_dump_tests {
         );
     }
 
-    /// Sanity check for the Argon2 family — both UUIDs in the spec are well-
+    /// Sanity check for the Argon2 family - both UUIDs in the spec are well-
     /// known, this test pins them so accidental edits to the constants get
     /// caught by CI rather than by users with corrupted vaults.
     #[test]

@@ -1198,7 +1198,7 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
 /// Check if two groups are dissimilar, ignoring their timestamps and pure
 /// UI view state. `is_expanded` and `last_top_visible_entry` are written by
 /// clients (e.g. KeePassXC) without bumping the modification time, so two
-/// otherwise-identical files routinely differ on them with tied timestamps —
+/// otherwise-identical files routinely differ on them with tied timestamps -
 /// treating that as divergence would fail the merge for view-only changes.
 fn have_groups_diverged(a: &Group, b: &Group) -> bool {
     let new_times = Times::default();
@@ -2010,7 +2010,7 @@ mod merge_tests {
     }
 
     /// Pure UI view state (IsExpanded, LastTopVisibleEntry) is written by
-    /// clients without bumping modification times — with tied timestamps it
+    /// clients without bumping modification times - with tied timestamps it
     /// must not count as divergence and must not fail the merge.
     #[test]
     fn test_view_state_only_divergence_is_not_a_merge_error() {

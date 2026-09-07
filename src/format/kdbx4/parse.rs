@@ -38,7 +38,7 @@ pub(crate) fn parse_kdbx4(data: &[u8], db_key: &DatabaseKey) -> Result<Database,
 }
 
 /// Decrypt a KDBX4 file and return the inner cleartext XML, no further
-/// XML→Database parsing. Intended for diagnostics — comparing what the
+/// XML→Database parsing. Intended for diagnostics - comparing what the
 /// crate's writer produces against what KeePass2/XC expect on read.
 ///
 /// Returns the XML bytes (typically UTF-8). Caller can `String::from_utf8_lossy`.

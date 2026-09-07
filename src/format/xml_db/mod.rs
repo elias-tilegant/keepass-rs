@@ -242,7 +242,7 @@ pub struct DeletedObjects {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-// `rename_all = "PascalCase"` is REQUIRED here — without it, `deletion_time`
+// `rename_all = "PascalCase"` is REQUIRED here - without it, `deletion_time`
 // serialises as snake_case `<deletion_time>` and we lose the value on every
 // read+write of any KeePass2-written vault (which writes `<DeletionTime>`).
 // Real-world vaults have hundreds of DeletedObjects from years of use; the
@@ -252,7 +252,7 @@ pub struct DeletedObject {
     #[serde(rename = "UUID")]
     uuid: UUID,
 
-    // See note in `meta.rs` — `Option<Timestamp>` must skip when None or
+    // See note in `meta.rs` - `Option<Timestamp>` must skip when None or
     // KeePass2 chokes parsing the empty `<DeletionTime/>` as base64 ticks.
     #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]
     deletion_time: Option<Timestamp>,

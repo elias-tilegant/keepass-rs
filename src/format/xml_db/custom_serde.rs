@@ -126,7 +126,7 @@ pub mod cs_opt_fromstr {
     }
 }
 
-/// `AutoType/DataTransferObfuscation` — KeePass's XSD declares this as
+/// `AutoType/DataTransferObfuscation` - KeePass's XSD declares this as
 /// `xs:int` (0 or 1), not `xs:boolean`. Writing `True`/`False` causes
 /// KeePassXC to reject the file with "invalid number value". This serde
 /// helper writes 0/1 on save and accepts both number- and boolean-shaped

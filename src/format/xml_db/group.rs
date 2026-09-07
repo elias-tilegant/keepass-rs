@@ -23,7 +23,7 @@ pub struct Group {
 
     pub name: String,
 
-    // See note in `meta.rs` — every Option needs `skip_serializing_if` so
+    // See note in `meta.rs` - every Option needs `skip_serializing_if` so
     // we don't emit `<Tag/>` placeholders that other KeePass clients reject
     // as malformed numbers / base64 / dateTime values.
     #[serde(default, with = "cs_opt_string", skip_serializing_if = "Option::is_none")]

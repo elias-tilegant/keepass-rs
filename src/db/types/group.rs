@@ -329,7 +329,7 @@ impl GroupMut<'_> {
 
     /// Add an entry with a caller-provided `EntryId` instead of a freshly
     /// generated one. Panics if an entry with that id already exists in the
-    /// database (caller's responsibility to avoid collisions — the typical
+    /// database (caller's responsibility to avoid collisions - the typical
     /// safe use is "import a remote-only entry during merge", where the id
     /// is by construction absent locally).
     pub fn add_entry_with_id(&mut self, id: EntryId) -> EntryMut<'_> {
