@@ -403,7 +403,12 @@ fn deconflict_custom_icons(dest_db: &Database, source_db: &Database) -> Option<D
             continue;
         }
         let mut fresh = CustomIconId::new();
-        while dest_db.custom_icons.contains_key(&fresh) || source_db.custom_icons.contains_key(&fresh) {
+        // Free in both tables and not already handed to an earlier collision
+        // in this same pass.
+        while dest_db.custom_icons.contains_key(&fresh)
+            || source_db.custom_icons.contains_key(&fresh)
+            || translations.values().any(|taken| *taken == fresh)
+        {
             fresh = CustomIconId::new();
         }
         translations.insert(*id, fresh);
