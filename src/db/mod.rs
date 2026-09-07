@@ -70,6 +70,13 @@ pub use crate::db::{
 #[cfg(feature = "totp")]
 pub use crate::db::otp::{TOTPAlgorithm, TOTPError, TOTP};
 
+// Exported so a consumer can decide whether a merge lost anything by matching
+// on `MergeWarning` rather than by parsing its `Display` text.
+#[cfg(feature = "_merge")]
+pub use crate::db::merge::{
+    MergeError, MergeEvent, MergeEventTarget, MergeEventType, MergeLog, MergeSide, MergeWarning,
+};
+
 #[cfg(test)]
 mod database_tests {
     use std::fs::File;

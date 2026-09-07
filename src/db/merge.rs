@@ -54,9 +54,137 @@ pub enum MergeError {
     MoveGroupError(#[from] MoveGroupError),
 }
 
+/// Which database an object came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeSide {
+    Destination,
+    Source,
+}
+
+impl std::fmt::Display for MergeSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MergeSide::Destination => write!(f, "Destination"),
+            MergeSide::Source => write!(f, "Source"),
+        }
+    }
+}
+
+/// Something the merge could not do cleanly, as data rather than prose.
+///
+/// The `Display` text is what humans read and what this type used to be. A
+/// consumer that has to decide whether a merge lost anything cannot make that
+/// call by matching on sentences: it breaks the moment a message is reworded,
+/// and it breaks silently, in the direction of accepting a lossy merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeWarning {
+    /// The root group has nowhere to move to, and never needs to.
+    CannotMoveRootGroup {
+        group: GroupId,
+    },
+    /// The destination lacks the group the source moved this one into, so the
+    /// move is dropped and the destination location kept.
+    CannotMoveGroup {
+        group: GroupId,
+        into: GroupId,
+    },
+    /// The destination lacks the parent group for a new entry, so the entry
+    /// is dropped.
+    CannotAddEntry {
+        entry: EntryId,
+        parent: GroupId,
+    },
+    /// The destination lacks the group the source moved this entry into.
+    CannotMoveEntry {
+        entry: EntryId,
+        into: GroupId,
+    },
+    /// No location-changed timestamp on one side, so the more recent move
+    /// cannot be determined and the destination location is kept.
+    AmbiguousGroupMove {
+        group: GroupId,
+    },
+    AmbiguousEntryMove {
+        entry: EntryId,
+    },
+    /// A current object has no last-modification timestamp; a substitute is
+    /// used, which decides a comparison the file did not.
+    MissingGroupTimestamp {
+        side: MergeSide,
+        group: GroupId,
+    },
+    MissingEntryTimestamp {
+        side: MergeSide,
+        entry: EntryId,
+    },
+    /// A history version has no timestamp. Substituting there is safe: the
+    /// two history lists are unioned rather than compared.
+    MissingHistoryTimestamp {
+        side: MergeSide,
+        entry: EntryId,
+    },
+    /// One side carried no history at all; an empty default is used.
+    NoHistory {
+        side: MergeSide,
+        entry: EntryId,
+    },
+    /// Two history versions share a timestamp and differ. Both are kept.
+    DivergedHistory {
+        entry: EntryId,
+        at: chrono::NaiveDateTime,
+    },
+}
+
+impl std::fmt::Display for MergeWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MergeWarning::CannotMoveRootGroup { group } => {
+                write!(f, "Cannot move root group {group}")
+            }
+            MergeWarning::CannotMoveGroup { group, into } => write!(
+                f,
+                "Cannot move group {group} to group {into} because the group does not exist in the destination database."
+            ),
+            MergeWarning::CannotAddEntry { entry, parent } => write!(
+                f,
+                "Cannot add entry {entry} because its parent group {parent} does not exist in the destination database."
+            ),
+            MergeWarning::CannotMoveEntry { entry, into } => write!(
+                f,
+                "Cannot move entry {entry} to group {into} because the group does not exist in the destination database."
+            ),
+            MergeWarning::AmbiguousGroupMove { group } => write!(
+                f,
+                "Cannot determine which group {group} move is more recent because one of the groups does not have a location changed timestamp."
+            ),
+            MergeWarning::AmbiguousEntryMove { entry } => write!(
+                f,
+                "Cannot determine which entry {entry} move is more recent because one of the entries does not have a location changed timestamp."
+            ),
+            MergeWarning::MissingGroupTimestamp { side, group } => {
+                write!(f, "{side} group {group} did not have a last modification timestamp")
+            }
+            MergeWarning::MissingEntryTimestamp { side, entry } => {
+                write!(f, "{side} entry {entry} did not have a last modification timestamp")
+            }
+            MergeWarning::MissingHistoryTimestamp { side, entry } => write!(
+                f,
+                "{side} history entry {entry} did not have a last modification timestamp"
+            ),
+            MergeWarning::NoHistory { side, entry } => {
+                write!(f, "{side} entry {entry} had no history.")
+            }
+            MergeWarning::DivergedHistory { entry, at } => write!(
+                f,
+                "History entries for {entry} have the same modification timestamp {at} but have diverged."
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MergeLog {
-    pub warnings: Vec<String>,
+    pub warnings: Vec<MergeWarning>,
     pub events: Vec<MergeEvent>,
 }
 
@@ -520,16 +648,15 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
                     // try to move the destination group to the new location.
 
                     let Some(parent_id) = source.parent().map(|p| p.id()) else {
-                        log.warnings.push(format!("Cannot move root group {}", id,));
+                        log.warnings.push(MergeWarning::CannotMoveRootGroup { group: id });
                         continue;
                     };
 
                     if !dest_groups.contains(&parent_id) {
-                        log.warnings.push(format!(
-                            "Cannot move group {} to group {} because the group does not exist in the destination database.",
-                            id,
-                            parent_id,
-                        ));
+                        log.warnings.push(MergeWarning::CannotMoveGroup {
+                            group: id,
+                            into: parent_id,
+                        });
                         continue;
                     };
 
@@ -545,26 +672,23 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
                     });
                 }
             } else {
-                log.warnings.push(format!(
-                    "Cannot determine which group {} move is more recent because one of the groups does not have a location changed timestamp.",
-                    id,
-                ));
+                log.warnings.push(MergeWarning::AmbiguousGroupMove { group: id });
             }
         }
 
         let dest_last_modification = dest.times.last_modification.unwrap_or_else(|| {
-            log.warnings.push(format!(
-                "Destination group {} did not have a last modification timestamp",
-                id
-            ));
+            log.warnings.push(MergeWarning::MissingGroupTimestamp {
+                side: MergeSide::Destination,
+                group: id,
+            });
             Times::now()
         });
 
         let source_last_modification = source.times.last_modification.unwrap_or_else(|| {
-            log.warnings.push(format!(
-                "Source group {} did not have a last modification timestamp",
-                id
-            ));
+            log.warnings.push(MergeWarning::MissingGroupTimestamp {
+                side: MergeSide::Source,
+                group: id,
+            });
             Times::epoch()
         });
 
@@ -657,10 +781,10 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
         let parent_id = source_entry.parent().id();
 
         if dest_db.group(parent_id).is_none() {
-            log.warnings.push(format!(
-                "Cannot add entry {} because its parent group {} does not exist in the destination database.",
-                id, parent_id,
-            ));
+            log.warnings.push(MergeWarning::CannotAddEntry {
+                entry: id,
+                parent: parent_id,
+            });
             continue;
         }
 
@@ -733,34 +857,30 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
                         });
                         dest_entry.times.location_changed = Some(slc);
                     } else {
-                        log.warnings.push(format!(
-                            "Cannot move entry {} to group {} because the group does not exist in the destination database.",
-                            id,
-                            source_parent_id,
-                        ));
+                        log.warnings.push(MergeWarning::CannotMoveEntry {
+                            entry: id,
+                            into: source_parent_id,
+                        });
                     }
                 }
             } else {
-                log.warnings.push(format!(
-                    "Cannot determine which entry {} move is more recent because one of the entries does not have a location changed timestamp.",
-                    id,
-                ));
+                log.warnings.push(MergeWarning::AmbiguousEntryMove { entry: id });
             }
         }
 
         let source_last_modification = source_entry.times.last_modification.unwrap_or_else(|| {
-            log.warnings.push(format!(
-                "Source entry {} did not have a last modification timestamp",
-                id
-            ));
+            log.warnings.push(MergeWarning::MissingEntryTimestamp {
+                side: MergeSide::Source,
+                entry: id,
+            });
             Times::epoch()
         });
 
         let dest_last_modification = dest_entry.times.last_modification.unwrap_or_else(|| {
-            log.warnings.push(format!(
-                "Destination entry {} did not have a last modification timestamp",
-                id
-            ));
+            log.warnings.push(MergeWarning::MissingEntryTimestamp {
+                side: MergeSide::Destination,
+                entry: id,
+            });
             Times::now()
         });
 
@@ -775,13 +895,18 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
         }
 
         let source_history = source_entry.history.clone().unwrap_or_else(|| {
-            log.warnings.push(format!("Source entry {} had no history.", id));
+            log.warnings.push(MergeWarning::NoHistory {
+                side: MergeSide::Source,
+                entry: id,
+            });
             History::default()
         });
 
         let dest_history = dest_entry.history.clone().unwrap_or_else(|| {
-            log.warnings
-                .push(format!("Destination entry {} had no history.", id));
+            log.warnings.push(MergeWarning::NoHistory {
+                side: MergeSide::Destination,
+                entry: id,
+            });
             History::default()
         });
 
@@ -840,20 +965,20 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
 
     for e in entries_dest.iter_mut() {
         if e.times.last_modification.is_none() {
-            log.warnings.push(format!(
-                "Destination history entry {} did not have a last modification timestamp",
-                e.id()
-            ));
+            log.warnings.push(MergeWarning::MissingHistoryTimestamp {
+                side: MergeSide::Destination,
+                entry: e.id(),
+            });
             e.times.last_modification = Some(Times::epoch());
         }
     }
 
     for e in entries_source.iter_mut() {
         if e.times.last_modification.is_none() {
-            log.warnings.push(format!(
-                "Source history entry {} did not have a last modification timestamp",
-                e.id()
-            ));
+            log.warnings.push(MergeWarning::MissingHistoryTimestamp {
+                side: MergeSide::Source,
+                entry: e.id(),
+            });
             e.times.last_modification = Some(Times::epoch());
         }
     }
@@ -882,11 +1007,10 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
                 } else if source_time > dest_time {
                     entries.push(entries_source.pop().unwrap());
                 } else if have_entries_diverged(dest_entry, source_entry) {
-                    log.warnings.push(format!(
-                        "History entries for {} have the same modification timestamp {} but have diverged.",
-                        dest_entry.id(),
-                        source_time,
-                    ));
+                    log.warnings.push(MergeWarning::DivergedHistory {
+                        entry: dest_entry.id(),
+                        at: source_time,
+                    });
 
                     // Both entries have the same timestamp but are different.
                     entries.push(entries_dest.pop().unwrap());
