@@ -217,6 +217,7 @@ impl Database {
         // reference index is rebuilt, or the destination ends up with
         // CustomIconUUIDs no client can resolve.
         adopt_source_custom_icons(self, source);
+        merge_custom_icon_metadata(self, source);
         rebuild_attachment_references(self);
         self.prune_unused_custom_icons();
 
@@ -570,6 +571,43 @@ fn deconflict_custom_icons(dest_db: &Database, source_db: &Database) -> Option<D
         }
     }
     Some(rewritten)
+}
+
+/// Carry an icon's name and modification time from the side that changed them
+/// last.
+///
+/// Deconfliction and adoption both key on the image bytes, and rightly so:
+/// the bytes are what decide whether two ids mean the same picture. But KDBX
+/// 4.1 stores a name and a modification time beside each image, and neither
+/// was merged at all, so renaming an icon on one machine was reverted by the
+/// other's next upload without anything being said.
+///
+/// Only ids both sides hold for the same image are considered. A different
+/// image under the same id is a different icon, which the deconfliction pass
+/// has already separated.
+fn merge_custom_icon_metadata(dest_db: &mut Database, source_db: &Database) {
+    for (id, source_icon) in &source_db.custom_icons {
+        let Some(dest_icon) = dest_db.custom_icons.get_mut(id) else {
+            continue;
+        };
+        if dest_icon.data != source_icon.data {
+            continue;
+        }
+        // Strictly newer, so a tie keeps the destination, the same way the
+        // rest of this merge treats one.
+        let source_is_newer = match (
+            dest_icon.last_modification_time,
+            source_icon.last_modification_time,
+        ) {
+            (Some(dest), Some(source)) => source > dest,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if source_is_newer {
+            dest_icon.name = source_icon.name.clone();
+            dest_icon.last_modification_time = source_icon.last_modification_time;
+        }
+    }
 }
 
 /// Every custom icon id an entry, an entry's history, or a group points at.
@@ -1304,6 +1342,58 @@ mod merge_tests {
         assert_eq!(
             dest.adopt_custom_icon_from(&empty, crate::db::CustomIconId::new()),
             None
+        );
+    }
+
+    /// KDBX 4.1 keeps a name and a modification time beside each image.
+    /// Neither was merged, so renaming an icon on one machine was reverted by
+    /// the other machine's next upload.
+    #[test]
+    fn a_renamed_custom_icon_carries_its_new_name() {
+        use chrono::TimeDelta;
+
+        use crate::db::Times;
+
+        let mut dest = create_test_database();
+        let image = vec![0x89, b'P', b'N', b'G', 7];
+        let icon_id = {
+            let mut group = dest.group_mut(GROUP1_ID).unwrap();
+            let mut icon = group.set_icon_custom_new(image.clone());
+            icon.name = Some("Old name".to_string());
+            icon.last_modification_time = Some(Times::now() - TimeDelta::minutes(10));
+            icon.id()
+        };
+        let mut source = dest.clone();
+        {
+            let mut icon = source.custom_icon_mut(icon_id).unwrap();
+            icon.name = Some("New name".to_string());
+            icon.last_modification_time = Some(Times::now());
+        }
+
+        dest.merge(&source).unwrap();
+
+        assert_eq!(
+            dest.custom_icon(icon_id).unwrap().name.as_deref(),
+            Some("New name"),
+            "the side that renamed it last decides the name"
+        );
+        assert_eq!(
+            dest.custom_icon(icon_id).unwrap().data,
+            image,
+            "and the image itself is untouched"
+        );
+
+        // The other direction: ours is newer, so theirs does not take it.
+        let mut source = dest.clone();
+        {
+            let mut icon = source.custom_icon_mut(icon_id).unwrap();
+            icon.name = Some("Stale name".to_string());
+            icon.last_modification_time = Some(Times::now() - TimeDelta::minutes(30));
+        }
+        dest.merge(&source).unwrap();
+        assert_eq!(
+            dest.custom_icon(icon_id).unwrap().name.as_deref(),
+            Some("New name")
         );
     }
 
