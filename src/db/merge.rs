@@ -1233,16 +1233,35 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
     Ok(History { entries })
 }
 
+/// The part of `Times` that is a setting rather than a record.
+///
+/// Everything else says when something happened and must not decide whether
+/// two objects differ. Expiry is the exception: it is something the user set,
+/// and wiping the whole block along with the rest made two same-second
+/// history versions that differ only in when they expire compare equal, so
+/// one of them was dropped without a word.
+///
+/// A date that is not in force says nothing either. KeePassXC writes an
+/// explicit far-future date on objects marked as never expiring, without
+/// touching their modification time, so comparing the raw pair would report
+/// divergence after an ordinary round trip through it.
+fn comparable_times(times: &Times) -> Times {
+    let in_force = times.expires.unwrap_or(false);
+    Times {
+        expires: Some(in_force),
+        expiry: in_force.then_some(times.expiry).flatten(),
+        ..Times::default()
+    }
+}
+
 /// Check if two groups are dissimilar, ignoring their timestamps and pure
 /// UI view state. `is_expanded` and `last_top_visible_entry` are written by
 /// clients (e.g. KeePassXC) without bumping the modification time, so two
 /// otherwise-identical files routinely differ on them with tied timestamps -
 /// treating that as divergence would fail the merge for view-only changes.
 fn have_groups_diverged(a: &Group, b: &Group) -> bool {
-    let new_times = Times::default();
-
     let mut a = a.clone();
-    a.times = new_times.clone();
+    a.times = comparable_times(&a.times);
     a.entries.clear();
     a.groups.clear();
     a.parent = None;
@@ -1250,7 +1269,7 @@ fn have_groups_diverged(a: &Group, b: &Group) -> bool {
     a.last_top_visible_entry = None;
 
     let mut b = b.clone();
-    b.times = new_times.clone();
+    b.times = comparable_times(&b.times);
     b.entries.clear();
     b.groups.clear();
     b.parent = None;
@@ -1260,16 +1279,15 @@ fn have_groups_diverged(a: &Group, b: &Group) -> bool {
     !a.eq(&b)
 }
 
-/// Check if two entries are dissimilar, ignoring their timestamps.
+/// Check if two entries are dissimilar, ignoring the timestamps that record
+/// when something happened.
 fn have_entries_diverged(a: &Entry, b: &Entry) -> bool {
-    let new_times = Times::default();
-
     let mut a = a.clone();
-    a.times = new_times.clone();
+    a.times = comparable_times(&a.times);
     a.history = None;
 
     let mut b = b.clone();
-    b.times = new_times.clone();
+    b.times = comparable_times(&b.times);
     b.history = None;
 
     !a.eq(&b)
@@ -1342,6 +1360,80 @@ mod merge_tests {
         assert_eq!(
             dest.adopt_custom_icon_from(&empty, crate::db::CustomIconId::new()),
             None
+        );
+    }
+
+    /// Expiry is a setting the user made, not a record of when something
+    /// happened. Wiping the whole `Times` block before comparing made two
+    /// same-second history versions that differ only in when they expire
+    /// compare equal, and one of them was then dropped without a word.
+    #[test]
+    fn a_history_version_that_differs_only_by_expiry_survives() {
+        use chrono::TimeDelta;
+
+        use crate::db::Times;
+
+        let same_second = Times::now() - TimeDelta::minutes(10);
+        let archived = |db: &mut Database, expires: bool| {
+            let mut version = db.entries.get(&ENTRY1_ID).unwrap().clone();
+            version.times = Times {
+                last_modification: Some(same_second),
+                expires: Some(expires),
+                expiry: expires.then_some(Times::now() + TimeDelta::days(30)),
+                ..Times::default()
+            };
+            version.history = None;
+            db.entry_mut(ENTRY1_ID)
+                .unwrap()
+                .history
+                .get_or_insert_default()
+                .add_entry(version);
+        };
+
+        let mut dest = create_test_database();
+        archived(&mut dest, false);
+        let mut source = dest.clone();
+        source.entry_mut(ENTRY1_ID).unwrap().history = None;
+        archived(&mut source, true);
+
+        dest.merge(&source).unwrap();
+
+        assert_eq!(
+            dest.entry(ENTRY1_ID)
+                .unwrap()
+                .history
+                .as_ref()
+                .map(|history| history.get_entries().len()),
+            Some(2),
+            "two versions that expire differently are two versions"
+        );
+
+        // A date that is not in force says nothing, though: KeePassXC writes
+        // a far-future one on objects marked as never expiring, and that must
+        // not read as divergence after an ordinary round trip through it.
+        let mut dest = create_test_database();
+        archived(&mut dest, false);
+        let mut source = dest.clone();
+        source
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .history
+            .as_mut()
+            .unwrap()
+            .entries[0]
+            .times
+            .expiry = Some(Times::now() + TimeDelta::days(3650));
+
+        dest.merge(&source).unwrap();
+
+        assert_eq!(
+            dest.entry(ENTRY1_ID)
+                .unwrap()
+                .history
+                .as_ref()
+                .map(|history| history.get_entries().len()),
+            Some(1),
+            "a date nobody is applying is not a difference"
         );
     }
 
