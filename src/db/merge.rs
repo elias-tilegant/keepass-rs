@@ -665,34 +665,53 @@ fn referenced_custom_icons(db: &Database) -> HashSet<CustomIconId> {
 /// cost n(n+1)/2, and the recursion went n deep on a file whose depth nobody
 /// here controls.
 fn subtree_last_updates(db: &Database) -> HashMap<GroupId, Option<NaiveDateTime>> {
-    let mut order: Vec<GroupId> = Vec::with_capacity(db.groups.len());
-    let mut stack = vec![db.root().id()];
-    while let Some(id) = stack.pop() {
-        order.push(id);
-        if let Some(group) = db.group(id) {
-            stack.extend(group.groups().map(|child| child.id()));
+    // Leaves upward over the flat map rather than a walk from the root: the
+    // callers ask about every group the map holds, and a group whose parent
+    // chain is broken would otherwise be answered with nothing at all, which
+    // lets a tombstone delete a branch written after the deletion.
+    let mut children_left: HashMap<GroupId, usize> = db.groups.keys().map(|id| (*id, 0)).collect();
+    for group in db.groups.values() {
+        if let Some(parent) = group.parent {
+            *children_left.entry(parent).or_insert(0) += 1;
         }
     }
 
-    let mut last: HashMap<GroupId, Option<NaiveDateTime>> = HashMap::with_capacity(order.len());
-    // A child is always pushed after its parent, so walking the order
-    // backwards reaches every child before the parent that needs it.
-    for id in order.into_iter().rev() {
-        let Some(group) = db.group(id) else {
+    let mut last: HashMap<GroupId, Option<NaiveDateTime>> = HashMap::with_capacity(db.groups.len());
+    let mut ready: Vec<GroupId> = children_left
+        .iter()
+        .filter(|(_, remaining)| **remaining == 0)
+        .map(|(id, _)| *id)
+        .collect();
+    while let Some(id) = ready.pop() {
+        let Some(group) = db.groups.get(&id) else {
             continue;
         };
         let own = group.times.last_modification.or(group.times.location_changed);
-        let max = group
-            .entries()
-            .filter_map(|e| e.times.last_modification.or(e.times.location_changed))
-            .chain(
-                group
-                    .groups()
-                    .filter_map(|child| last.get(&child.id()).copied().flatten()),
-            )
-            .chain(own)
-            .max();
-        last.insert(id, max);
+        let entries = group.entries.iter().filter_map(|entry| {
+            db.entries
+                .get(entry)
+                .and_then(|e| e.times.last_modification.or(e.times.location_changed))
+        });
+        let children = group
+            .groups
+            .iter()
+            .filter_map(|child| last.get(child).copied().flatten());
+        last.insert(id, entries.chain(children).chain(own).max());
+
+        if let Some(remaining) = group.parent.and_then(|parent| children_left.get_mut(&parent)) {
+            *remaining -= 1;
+            if *remaining == 0 {
+                #[allow(clippy::unwrap_used)] // guarded by the `and_then` above
+                ready.push(group.parent.unwrap());
+            }
+        }
+    }
+    // Only a cycle can leave a group unanswered, and a cycle is a broken file
+    // rather than a shape to reason about. Its own time is the honest floor:
+    // never less than what the group itself records.
+    for (id, group) in &db.groups {
+        last.entry(*id)
+            .or_insert_with(|| group.times.last_modification.or(group.times.location_changed));
     }
     last
 }
@@ -1491,6 +1510,40 @@ mod merge_tests {
             "nothing was touched after it, so the deletion stands"
         );
         assert!(dest.entry(ENTRY2_ID).is_none(), "and takes its entry with it");
+    }
+
+    /// The callers ask about every group the file holds, not only the ones
+    /// the root can reach. Walking down from the root answered nothing for a
+    /// group whose parent chain is broken, and a tombstone could then delete
+    /// a branch written long after the deletion.
+    #[test]
+    fn a_group_the_root_cannot_reach_still_reports_its_freshness() {
+        use chrono::TimeDelta;
+
+        use crate::db::Times;
+
+        let deleted_at = Times::now() - TimeDelta::minutes(10);
+        let mut dest = create_test_database();
+        for id in [GROUP1_ID, SUBGROUP1_ID] {
+            dest.group_mut(id).unwrap().times.last_modification = Some(deleted_at);
+        }
+        dest.entry_mut(ENTRY2_ID).unwrap().times.last_modification = Some(Times::now());
+        // Detach the branch from the root without removing it, the shape a
+        // file written by something else can carry.
+        dest.groups.get_mut(&GROUP1_ID).unwrap().parent = None;
+        dest.groups
+            .get_mut(&ROOT_GROUP_ID)
+            .unwrap()
+            .groups
+            .remove(&GROUP1_ID);
+
+        let freshness = super::subtree_last_updates(&dest);
+
+        assert_eq!(
+            freshness.get(&GROUP1_ID).copied().flatten(),
+            dest.entry(ENTRY2_ID).unwrap().times.last_modification,
+            "the detached branch still reports the entry written inside it"
+        );
     }
 
     /// A move nobody can rank decides nothing. Keeping the destination on a
