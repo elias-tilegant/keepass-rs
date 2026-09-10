@@ -935,7 +935,9 @@ fn merge_groups(dest_db: &mut Database, source_db: &Database, log: &mut MergeLog
         });
 
         if dest_last_modification == source_last_modification {
-            if have_groups_diverged(&dest, &source) {
+            // Each side's icon reference resolves against its own database.
+            let dest_ref = dest.as_ref();
+            if have_groups_diverged(&dest_ref, dest_ref.database(), &source, source_db) {
                 // This should never happen.
                 //
                 // A group was updated without updating the last modification timestamp.
@@ -1135,7 +1137,11 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
         });
 
         if dest_last_modification == source_last_modification {
-            if have_entries_diverged(&dest_entry, &source_entry) {
+            // `source_entry` came through `import_entry`, which translates
+            // attachment ids and nothing else, so its icon reference still
+            // resolves against the source database.
+            let dest_ref = dest_entry.as_ref();
+            if have_entries_diverged(&dest_ref, dest_ref.database(), &source_entry, source_db) {
                 // This should never happen.
                 //
                 // An entry was updated without updating the last modification timestamp.
@@ -1146,8 +1152,10 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             // returning here dropped it: the next save writes only what this
             // database holds, so the other side's copy went with it.
             let merged_history = merge_history(
-                dest_entry.history.as_ref().unwrap_or(&History::default()),
+                dest_ref.history.as_ref().unwrap_or(&History::default()),
+                dest_ref.database(),
                 source_entry.history.as_ref().unwrap_or(&History::default()),
+                source_db,
                 log,
             )?;
             if dest_entry.history.as_ref() != Some(&merged_history) {
@@ -1172,7 +1180,16 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
             History::default()
         });
 
-        let mut merged_history = merge_history(&dest_history, &source_history, log)?;
+        let mut merged_history = {
+            let dest_ref = dest_entry.as_ref();
+            merge_history(
+                &dest_history,
+                dest_ref.database(),
+                &source_history,
+                source_db,
+                log,
+            )?
+        };
         let merged_location_timestamp = dest_entry
             .times
             .location_changed
@@ -1180,10 +1197,20 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 
         if source_last_modification > dest_last_modification {
             // add the previous dest entry to history if it has diverged
-            let should_archive_dest = merged_history
-                .entries
-                .first()
-                .is_none_or(|last_history_entry| have_entries_diverged(&dest_entry, last_history_entry));
+            //
+            // The newest merged version can come from either side, so its icon
+            // reference is read against the destination and falls back to id
+            // equality when the picture is not there. That errs towards
+            // archiving, which costs a version rather than losing one.
+            let dest_ref = dest_entry.as_ref();
+            let should_archive_dest = merged_history.entries.first().is_none_or(|last_history_entry| {
+                have_entries_diverged(
+                    &dest_ref,
+                    dest_ref.database(),
+                    last_history_entry,
+                    dest_ref.database(),
+                )
+            });
             if should_archive_dest {
                 let mut dest_entry_for_history = dest_entry.deref().clone();
                 dest_entry_for_history.history = None;
@@ -1225,7 +1252,17 @@ fn merge_entries(dest_db: &mut Database, source_db: &Database, log: &mut MergeLo
 }
 
 /// Merge two histories together, returning the merged history.
-fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result<History, MergeError> {
+///
+/// Each history is paired with the database its versions' icon references
+/// resolve against, because a tie between two versions is settled by comparing
+/// them.
+fn merge_history(
+    dest: &History,
+    dest_db: &Database,
+    source: &History,
+    source_db: &Database,
+    log: &mut MergeLog,
+) -> Result<History, MergeError> {
     let mut entries: Vec<Entry> = Vec::new();
 
     let mut entries_dest: Vec<Entry> = dest.entries.to_vec();
@@ -1274,7 +1311,7 @@ fn merge_history(dest: &History, source: &History, log: &mut MergeLog) -> Result
                     entries.push(entries_dest.pop().unwrap());
                 } else if source_time > dest_time {
                     entries.push(entries_source.pop().unwrap());
-                } else if have_entries_diverged(dest_entry, source_entry) {
+                } else if have_entries_diverged(dest_entry, dest_db, source_entry, source_db) {
                     log.warnings.push(MergeWarning::DivergedHistory {
                         entry: dest_entry.id(),
                         at: source_time,
@@ -1326,12 +1363,38 @@ fn comparable_times(times: &Times) -> Times {
     }
 }
 
+/// Whether two icon references show the same icon.
+///
+/// A custom icon id is bookkeeping, not identity: [`adopt_source_custom_icons`]
+/// retargets a reference to whichever id the other side already holds for those
+/// bytes, so one merge leaves two files showing one picture under two ids, with
+/// nothing recording a change. Comparing the ids called that divergence and
+/// failed the next tied merge. Where a picture is missing the ids are all that
+/// is left to compare.
+fn icons_match(a: Option<&Icon>, a_db: &Database, b: Option<&Icon>, b_db: &Database) -> bool {
+    match (a, b) {
+        (Some(Icon::Custom(a_id)), Some(Icon::Custom(b_id))) => {
+            match (a_db.custom_icons.get(a_id), b_db.custom_icons.get(b_id)) {
+                (Some(a_icon), Some(b_icon)) => a_icon.data == b_icon.data,
+                _ => a_id == b_id,
+            }
+        }
+        _ => a == b,
+    }
+}
+
 /// Check if two groups are dissimilar, ignoring their timestamps and pure
 /// UI view state. `is_expanded` and `last_top_visible_entry` are written by
 /// clients (e.g. KeePassXC) without bumping the modification time, so two
 /// otherwise-identical files routinely differ on them with tied timestamps -
 /// treating that as divergence would fail the merge for view-only changes.
-fn have_groups_diverged(a: &Group, b: &Group) -> bool {
+///
+/// Each group is paired with the database its icon reference resolves against.
+fn have_groups_diverged(a: &Group, a_db: &Database, b: &Group, b_db: &Database) -> bool {
+    if !icons_match(a.icon.as_ref(), a_db, b.icon.as_ref(), b_db) {
+        return true;
+    }
+
     let mut a = a.clone();
     a.times = comparable_times(&a.times);
     a.entries.clear();
@@ -1339,6 +1402,8 @@ fn have_groups_diverged(a: &Group, b: &Group) -> bool {
     a.parent = None;
     a.is_expanded = false;
     a.last_top_visible_entry = None;
+    // Settled above, where two ids can still mean one picture.
+    a.icon = None;
 
     let mut b = b.clone();
     b.times = comparable_times(&b.times);
@@ -1347,20 +1412,30 @@ fn have_groups_diverged(a: &Group, b: &Group) -> bool {
     b.parent = None;
     b.is_expanded = false;
     b.last_top_visible_entry = None;
+    b.icon = None;
 
     !a.eq(&b)
 }
 
 /// Check if two entries are dissimilar, ignoring the timestamps that record
 /// when something happened.
-fn have_entries_diverged(a: &Entry, b: &Entry) -> bool {
+///
+/// Each entry is paired with the database its icon reference resolves against.
+fn have_entries_diverged(a: &Entry, a_db: &Database, b: &Entry, b_db: &Database) -> bool {
+    if !icons_match(a.icon.as_ref(), a_db, b.icon.as_ref(), b_db) {
+        return true;
+    }
+
     let mut a = a.clone();
     a.times = comparable_times(&a.times);
     a.history = None;
+    // Settled above, where two ids can still mean one picture.
+    a.icon = None;
 
     let mut b = b.clone();
     b.times = comparable_times(&b.times);
     b.history = None;
+    b.icon = None;
 
     !a.eq(&b)
 }
@@ -2277,6 +2352,231 @@ mod merge_tests {
             dest.num_custom_icons(),
             2,
             "one uuid was renamed rather than one image being lost"
+        );
+    }
+
+    /// A merge lets a reference share a picture the other side already holds
+    /// under its own id, so one round trip leaves both copies showing one
+    /// picture under two ids, with nothing recording a change. Compared by id
+    /// that was a divergence, and the next tied merge was refused outright.
+    #[test]
+    fn tied_entries_showing_one_picture_under_two_ids_are_not_diverged() {
+        use std::collections::HashSet;
+
+        use crate::db::{CustomIcon, CustomIconId, Icon};
+
+        let picture = vec![0x89, b'P', b'N', b'G', 1];
+        let tied = Times::now();
+
+        let mut dest = create_test_database();
+        let ours = dest
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .set_icon_custom_new(picture.clone())
+            .id();
+        dest.entry_mut(ENTRY1_ID).unwrap().times.last_modification = Some(tied);
+
+        // The same picture there, under an id only that copy uses.
+        let mut source = dest.clone();
+        let theirs = CustomIconId::new();
+        source.custom_icons.insert(
+            theirs,
+            CustomIcon {
+                id: theirs,
+                entries: HashSet::new(),
+                groups: HashSet::new(),
+                data: picture.clone(),
+                name: None,
+                last_modification_time: None,
+            },
+        );
+        source
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .set_icon_custom(theirs)
+            .expect("the icon was just inserted");
+        source.entry_mut(ENTRY1_ID).unwrap().times.last_modification = Some(tied);
+        assert_ne!(ours, theirs, "one picture, two ids");
+
+        dest.merge(&source).expect("one picture is not a divergence");
+
+        assert_eq!(
+            dest.entry(ENTRY1_ID).unwrap().icon(),
+            Some(&Icon::Custom(ours)),
+            "a tie leaves the destination its own reference"
+        );
+        assert_eq!(
+            dest.num_custom_icons(),
+            1,
+            "and no second record for the same picture"
+        );
+    }
+
+    /// The same for a group, which the merge ranks on its own clock and
+    /// refuses on its own divergence check.
+    #[test]
+    fn tied_groups_showing_one_picture_under_two_ids_are_not_diverged() {
+        use std::collections::HashSet;
+
+        use crate::db::{CustomIcon, CustomIconId, Icon};
+
+        let picture = vec![0x89, b'P', b'N', b'G', 2];
+        let tied = Times::now();
+
+        let mut dest = create_test_database();
+        let ours = dest
+            .group_mut(GROUP1_ID)
+            .unwrap()
+            .set_icon_custom_new(picture.clone())
+            .id();
+        dest.group_mut(GROUP1_ID).unwrap().times.last_modification = Some(tied);
+
+        let mut source = dest.clone();
+        let theirs = CustomIconId::new();
+        source.custom_icons.insert(
+            theirs,
+            CustomIcon {
+                id: theirs,
+                entries: HashSet::new(),
+                groups: HashSet::new(),
+                data: picture.clone(),
+                name: None,
+                last_modification_time: None,
+            },
+        );
+        source
+            .group_mut(GROUP1_ID)
+            .unwrap()
+            .set_icon_custom(theirs)
+            .expect("the icon was just inserted");
+        source.group_mut(GROUP1_ID).unwrap().times.last_modification = Some(tied);
+        assert_ne!(ours, theirs, "one picture, two ids");
+
+        dest.merge(&source).expect("one picture is not a divergence");
+
+        assert_eq!(
+            dest.group(GROUP1_ID).unwrap().icon(),
+            Some(&Icon::Custom(ours)),
+            "a tie leaves the destination its own reference"
+        );
+        assert_eq!(
+            dest.num_custom_icons(),
+            1,
+            "and no second record for the same picture"
+        );
+    }
+
+    /// The merge retargets an archived version's reference too. Compared by
+    /// id, two copies of one version each looked like a version the other had
+    /// never seen, so both were kept and every round trip added another pair.
+    #[test]
+    fn tied_archived_versions_showing_one_picture_under_two_ids_merge_as_one() {
+        use std::collections::HashSet;
+
+        use crate::db::{CustomIcon, CustomIconId, Icon, MergeWarning};
+
+        let picture = vec![0x89, b'P', b'N', b'G', 3];
+        let tied = Times::now();
+        let archived_at = tied - chrono::Duration::minutes(5);
+
+        let mut dest = create_test_database();
+        dest.entry_mut(ENTRY1_ID)
+            .unwrap()
+            .set_icon_custom_new(picture.clone());
+        add_history_version(&mut dest, ENTRY1_ID, "archived", archived_at);
+        dest.entry_mut(ENTRY1_ID).unwrap().times.last_modification = Some(tied);
+
+        // Only the archived version differs, and only in which id it names:
+        // the current versions still agree, so this is the history's tie.
+        let mut source = dest.clone();
+        let theirs = CustomIconId::new();
+        source.custom_icons.insert(
+            theirs,
+            CustomIcon {
+                id: theirs,
+                entries: HashSet::new(),
+                groups: HashSet::new(),
+                data: picture.clone(),
+                name: None,
+                last_modification_time: None,
+            },
+        );
+        source
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .history
+            .as_mut()
+            .expect("the version added above")
+            .entries[0]
+            .icon = Some(Icon::Custom(theirs));
+
+        let log = dest.merge(&source).expect("merge");
+
+        assert!(
+            !log.warnings
+                .iter()
+                .any(|warning| matches!(warning, MergeWarning::DivergedHistory { .. })),
+            "one picture is one version: {:?}",
+            log.warnings
+        );
+        assert_eq!(
+            dest.entry(ENTRY1_ID)
+                .unwrap()
+                .history
+                .as_ref()
+                .expect("history")
+                .get_entries()
+                .len(),
+            1,
+            "and it is kept once"
+        );
+        assert_eq!(dest.num_custom_icons(), 1);
+    }
+
+    /// Two pictures are still two icons. Only the id is bookkeeping, so a tie
+    /// that names two different pictures is somebody's edit on both sides and
+    /// has to keep failing closed rather than pick one.
+    #[test]
+    fn tied_entries_showing_different_pictures_under_two_ids_still_fail() {
+        use std::collections::HashSet;
+
+        use super::MergeError;
+        use crate::db::{CustomIcon, CustomIconId};
+
+        let tied = Times::now();
+
+        let mut dest = create_test_database();
+        dest.entry_mut(ENTRY1_ID)
+            .unwrap()
+            .set_icon_custom_new(vec![0x89, b'P', b'N', b'G', 4]);
+        dest.entry_mut(ENTRY1_ID).unwrap().times.last_modification = Some(tied);
+
+        let mut source = dest.clone();
+        let theirs = CustomIconId::new();
+        source.custom_icons.insert(
+            theirs,
+            CustomIcon {
+                id: theirs,
+                entries: HashSet::new(),
+                groups: HashSet::new(),
+                data: vec![0x89, b'P', b'N', b'G', 5],
+                name: None,
+                last_modification_time: None,
+            },
+        );
+        source
+            .entry_mut(ENTRY1_ID)
+            .unwrap()
+            .set_icon_custom(theirs)
+            .expect("the icon was just inserted");
+        source.entry_mut(ENTRY1_ID).unwrap().times.last_modification = Some(tied);
+
+        assert!(
+            matches!(
+                dest.merge(&source),
+                Err(MergeError::EntryModificationTimeNotUpdated(id)) if id == ENTRY1_ID
+            ),
+            "two pictures in one second is somebody's edit, not bookkeeping"
         );
     }
 
